@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pgsqlasync2fast-fastapi"
-version = "0.1.0"
+version = "0.1.1"
 description = "Simple and fast PostgreSQL async module for FastAPI with multi-database support"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,6 +32,7 @@ dependencies = [
     "pydantic-settings>=2.0.0",
     "sqlalchemy>=2.0.0",
     "asyncpg>=0.29.0",
+    "greenlet>=3.0.0",
 ]
 
 [project.optional-dependencies]

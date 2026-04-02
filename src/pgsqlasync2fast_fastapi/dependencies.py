@@ -5,7 +5,8 @@ FastAPI dependencies for database functionality
 from typing import AsyncGenerator, Optional
 
 from fastapi import Depends
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from .connection import DatabaseManager, get_manager
 from .settings import DatabaseSettings, settings

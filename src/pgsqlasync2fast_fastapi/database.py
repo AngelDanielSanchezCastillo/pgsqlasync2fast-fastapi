@@ -5,7 +5,6 @@ Database creation and management utilities
 from typing import List, Optional
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
 
 from .connection import get_manager
 from .settings import settings

@@ -1,16 +1,23 @@
 """
-pgsqlasync2fast-fastapi - Simple and fast PostgreSQL async module for FastAPI
+pgsqlasync2fast-fastapi - PostgreSQL async extensions for FastAPI
 
-A comprehensive PostgreSQL async module for FastAPI with multi-database support,
-automatic database creation, and Pydantic settings configuration.
+This package provides database management and seeding capabilities.
 
-Features:
-- Multiple database connection support
-- Async database operations with SQLAlchemy
-- Database creation utilities with superuser support
-- Connection pooling and health checks
-- FastAPI integration with dependencies
-- Lazy engine creation for optimal resource usage
+The seeder module provides multi-package JSON seeder orchestration.
+
+Example:
+    from pgsqlasync2fast_fastapi import seed_all, register_seeder, SeederConfig
+
+    # Register a package's seeder
+    register_seeder(SeederConfig(
+        connection_name="auth",
+        manifest_path="path/to/manifest.json",
+        package_name="my-package",
+        priority=50
+    ))
+
+    # Execute all seeders
+    result = await seed_all("dev")
 """
 
 from .__version__ import __version__
@@ -24,6 +31,26 @@ from .dependencies import (
     startup_database,
 )
 from .settings import DatabaseConnectionSettings, DatabaseSettings, settings
+
+# Import seeder module
+from pgsqlasync2fast_fastapi import seeder
+
+# Re-export seeder-specific exports
+from pgsqlasync2fast_fastapi.seeder import (
+    # Dataclasses
+    SeederConfig,
+    SeederResult,
+    # Exceptions
+    SeederException,
+    SeederConflictError,
+    SeedValidationError,
+    # Registry functions
+    register_seeder,
+    get_registered_seeders,
+    clear_registry,
+    # Main orchestrator
+    seed_all,
+)
 
 __all__ = [
     # Version
@@ -46,4 +73,17 @@ __all__ = [
     "create_database",
     "drop_database",
     "list_databases",
+    # Dataclasses (seeder)
+    "SeederConfig",
+    "SeederResult",
+    # Exceptions (seeder)
+    "SeederException",
+    "SeederConflictError",
+    "SeedValidationError",
+    # Registry functions (seeder)
+    "register_seeder",
+    "get_registered_seeders",
+    "clear_registry",
+    # Main orchestrator (seeder)
+    "seed_all",
 ]

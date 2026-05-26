@@ -1,0 +1,62 @@
+[
+  {
+    "id": 1,
+    "name": "users:read",
+    "description": "View user information",
+    "category_id": 1
+  },
+  {
+    "id": 2,
+    "name": "users:create",
+    "description": "Create new users",
+    "category_id": 1
+  },
+  {
+    "id": 3,
+    "name": "users:update",
+    "description": "Update existing users",
+    "category_id": 1
+  },
+  {
+    "id": 4,
+    "name": "users:delete",
+    "description": "Delete users",
+    "category_id": 1
+  },
+  {
+    "id": 5,
+    "name": "roles:read",
+    "description": "View role information",
+    "category_id": 2
+  },
+  {
+    "id": 6,
+    "name": "roles:create",
+    "description": "Create new roles",
+    "category_id": 2
+  },
+  {
+    "id": 7,
+    "name": "roles:update",
+    "description": "Update existing roles",
+    "category_id": 2
+  },
+  {
+    "id": 8,
+    "name": "roles:delete",
+    "description": "Delete roles",
+    "category_id": 2
+  },
+  {
+    "id": 9,
+    "name": "system:config",
+    "description": "Modify system configuration",
+    "category_id": 3
+  },
+  {
+    "id": 10,
+    "name": "system:audit",
+    "description": "View audit logs",
+    "category_id": 3
+  }
+]

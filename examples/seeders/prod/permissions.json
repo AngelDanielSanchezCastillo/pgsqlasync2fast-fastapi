@@ -1,0 +1,38 @@
+[
+  {
+    "id": 1,
+    "name": "users:read",
+    "description": "View user information",
+    "category_id": 1
+  },
+  {
+    "id": 2,
+    "name": "users:create",
+    "description": "Create new users",
+    "category_id": 1
+  },
+  {
+    "id": 3,
+    "name": "users:update",
+    "description": "Update existing users",
+    "category_id": 1
+  },
+  {
+    "id": 4,
+    "name": "roles:read",
+    "description": "View role information",
+    "category_id": 2
+  },
+  {
+    "id": 5,
+    "name": "roles:create",
+    "description": "Create new roles",
+    "category_id": 2
+  },
+  {
+    "id": 6,
+    "name": "roles:update",
+    "description": "Update existing roles",
+    "category_id": 2
+  }
+]

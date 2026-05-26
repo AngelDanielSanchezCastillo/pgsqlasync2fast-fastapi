@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pgsqlasync2fast-fastapi"
-version = "0.2.0"
+version = "0.3.0"
 description = "Simple and fast PostgreSQL async module for FastAPI with multi-database support"
 readme = "README.md"
 requires-python = ">=3.10"

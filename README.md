@@ -2,6 +2,8 @@
 
 Simple and fast PostgreSQL async module for FastAPI with multi-database support and automatic database creation.
 
+> 📖 **Conventions reference**: this package follows the [2fast-handbook](https://github.com/AngelDanielSanchezCastillo/2fast-handbook) for ecosystem conventions (structure, versioning, README, commits, release).
+
 ## Features
 
 - ✅ **Multiple Database Connections**: Configure and manage multiple PostgreSQL databases

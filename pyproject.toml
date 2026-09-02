@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pgsqlasync2fast-fastapi"
-version = "0.3.0"
+dynamic = ["version"]
 description = "Simple and fast PostgreSQL async module for FastAPI with multi-database support"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -63,6 +63,10 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["pgsqlasync2fast_fastapi*"]
+
+# Single source of truth for the version: __version__.py
+[tool.setuptools.dynamic]
+version = {attr = "pgsqlasync2fast_fastapi.__version__.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

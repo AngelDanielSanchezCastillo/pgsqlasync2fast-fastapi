@@ -148,18 +148,53 @@ register_seeder(SeederConfig(
 
 ## Conflict Detection
 
-When registering a seeder, the system detects table conflicts.
+When registering a seeder, the system detects table conflicts between **distinct** packages.
 
 ### Rule
 
-Two packages CANNOT seed the same table in the same connection.
+Two DIFFERENT packages (`(connection_name, package_name)` keys) CANNOT seed the same table in the same connection. Re-registering the same key is an override, never a conflict.
 
 ### Error
 
-If conflicts are detected, `SeederConflictError` is raised:
+If a distinct package's tables overlap an already-registered package on the same connection, `SeederConflictError` is raised:
 ```
 Tables {'roles'} conflict between 'pkg-a' and 'pkg-b' on connection 'auth'
 ```
+
+## Override & Idempotency (single-entry)
+
+The registry is keyed by `(connection_name, package_name)`, so registering the same package+connection repeatedly updates **one single entry** — no duplicate registry entries.
+
+`register_seeder(config, mode=...)` supports two override behaviors:
+
+| `mode` | Behavior |
+|--------|----------|
+| `"retain_base"` (default) | Replaces the entry's config fields but **merges** the prior entry's manifest `model_classes` into the new config's set. Base tables are preserved when an app extends a package seeder (e.g. keeps permissions2fast base tables while adding route tables). |
+| `"replace"` | Replaces the prior entry wholesale. |
+
+Re-registering the **same** `(connection, package)` key never raises `SeederConflictError`. Only a **distinct** package on the same connection with overlapping tables raises it.
+
+### Example
+
+```python
+# Base permissions2fast seeder auto-registered on "auth"
+register_seeder(SeederConfig(
+    connection_name="auth",
+    manifest_path="permissions2fast_fastapi/seeders/manifest.json",
+    package_name="permissions2fast-fastapi",
+    priority=60,
+))
+
+# App extends it by ADDING route tables, keeping the base manifest set
+register_seeder(SeederConfig(
+    connection_name="auth",
+    manifest_path="app/rbac_route_manifest.json",
+    package_name="permissions2fast-fastapi",   # same key -> override
+    model_classes={"routes": RouteModel},
+), mode="retain_base")
+```
+
+The result is a single `permissions2fast-fastapi` entry whose `model_classes` contain both the base `roles`/`permissions` models and the new `routes` model.
 
 ## Idempotency
 
@@ -167,6 +202,7 @@ The seeder is idempotent - running multiple times produces the same result.
 
 - Rows with existing IDs are skipped
 - Only new rows are inserted
+- Registry registration is idempotent per key - no duplicate entries
 
 This allows safe re-runs without duplicating data.
 

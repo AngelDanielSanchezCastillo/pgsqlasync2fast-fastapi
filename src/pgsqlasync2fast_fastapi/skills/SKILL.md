@@ -4,7 +4,7 @@ description: "Trigger: working on or with pgsqlasync2fast-fastapi. Multi-databas
 license: MIT
 metadata:
   author: AngelDanielSanchezCastillo
-  version: "1.0"
+  version: "2.0"
 ---
 
 ## Purpose
@@ -51,8 +51,13 @@ Downstream imports (stable contracts): oauth2fast `get_db_session`→`partial(..
 
 ## Seeder orchestrator
 
-- `register_seeder` does registration-time **table-conflict detection** per connection (`SeederConflictError` if two seeders on the same connection share a manifest `tables` key).
-- `seed_all(profile, package_filter=None)` sorts by `priority` (LOWER first). **Skips** registered seeders with `is_tenant_seeder=True` and no `seed_fn` (warns — tenant seeding must be driven by `seed_all_tenants`/the tenant package itself).
+- The seeder registry is **keyed by `(connection_name, package_name)`** — re-registering the same key updates that single entry in place (idempotent, no duplicates).
+- `register_seeder(config, mode="retain_base")` is the **override primitive**:
+  - `mode="retain_base"` (default, backward-compatible): an existing same-key entry's config fields are replaced but its prior manifest `model_classes` are **merged** into the new config's set — base tables are preserved when an app extends a package seeder.
+  - `mode="replace"`: the prior same-key entry is replaced wholesale.
+  - Re-registering the same key NEVER raises `SeederConflictError`.
+- Registration-time **table-conflict detection** applies only to *distinct* `(connection, package)` keys: `SeederConflictError` if two different packages on the same connection share a manifest `tables` key.
+- `seed_all(profile, package_filter=None)` sorts registered values by `priority` (LOWER first). **Skips** registered seeders with `is_tenant_seeder=True` and no `seed_fn` (warns — tenant seeding must be driven by `seed_all_tenants`/the tenant package itself).
 - Generic path: topological sort of `depends_on` (cycle → `SeedValidationError`), FK resolution `fk_field_mapping`/`fk_fields`/`rstrip('s')+'_id'`, insert **per row** with explicit `id` → idempotent (SELECT by id, skip if exists, commit per row).
 
 ## Settings

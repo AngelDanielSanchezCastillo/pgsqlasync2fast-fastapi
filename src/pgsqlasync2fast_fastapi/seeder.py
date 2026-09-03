@@ -32,7 +32,7 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
@@ -133,25 +133,38 @@ class SeederResult:
 # ============================================================================
 
 
-_SEEDER_REGISTRY: list[SeederConfig] = []
+_SEEDER_REGISTRY: dict[tuple[str, str], SeederConfig] = {}
 
 
-def register_seeder(config: SeederConfig) -> None:
+def register_seeder(
+    config: SeederConfig,
+    mode: Literal["retain_base", "replace"] = "retain_base",
+) -> None:
     """
-    Register a package's seeder configuration.
+    Register a package's seeder configuration, keyed by (connection, package).
 
-    Validates that there are no table conflicts between packages using
-    the same connection name. Two packages cannot seed the same table
-    in the same connection.
+    The registry is a dict keyed by ``(connection_name, package_name)``, so a
+    repeated registration of the same key updates that single entry in place
+    (idempotent - no duplicate registry entries).
 
-    The validation happens at registration time (not execution time) to fail
-    fast and provide clear error messages.
+    Conflict detection only applies to *distinct* packages on the same
+    connection: if two different ``(connection, package)`` keys overlap on
+    shared manifest tables, ``SeederConflictError`` is raised. Re-registering
+    the same key NEVER raises - it is an override/update, not a conflict.
 
     Args:
-        config: SeederConfig with connection_name, manifest_path, and priority
+        config: SeederConfig with connection_name, manifest_path, and priority.
+        mode: Override behavior when the same key is already registered:
+            - ``"retain_base"`` (default, backward-compatible): replace the
+              entry's config fields but MERGE the prior entry's manifest
+              ``model_classes`` into the new config's set (base tables are
+              preserved when an app extends rather than replaces).
+            - ``"replace"``: replace the prior entry wholesale.
 
     Raises:
-        SeederConflictError: If tables overlap with an already-registered seeder
+        ValueError: If ``mode`` is not one of the supported values.
+        SeederConflictError: If a *distinct* package on the same connection
+            shares overlapping tables with an already-registered seeder.
 
     Example:
         register_seeder(SeederConfig(
@@ -161,12 +174,21 @@ def register_seeder(config: SeederConfig) -> None:
             priority=60
         ))
     """
-    # Load manifests to check for conflicts
-    for existing in _SEEDER_REGISTRY:
-        if existing.connection_name != config.connection_name:
+    if mode not in ("retain_base", "replace"):
+        raise ValueError(f"Unsupported register_seeder mode: {mode!r}")
+
+    key = (config.connection_name, config.package_name)
+
+    # True conflict: a DIFFERENT package on the same connection overlapping
+    # on manifest tables. Same key is an override, never a conflict.
+    # The new config's manifest is only loaded when a candidate exists, so a
+    # lone registration with a missing manifest still succeeds (as before).
+    for (conn, pkg), existing in _SEEDER_REGISTRY.items():
+        if conn != config.connection_name:
+            continue
+        if (conn, pkg) == key:
             continue
 
-        # Same connection - check for table overlap
         tables_a = set(_load_manifest(existing.manifest_path)["tables"].keys())
         tables_b = set(_load_manifest(config.manifest_path)["tables"].keys())
         overlap = tables_a & tables_b
@@ -180,9 +202,20 @@ def register_seeder(config: SeederConfig) -> None:
                 f"on connection '{config.connection_name}'"
             )
 
-    _SEEDER_REGISTRY.append(config)
+    prior = _SEEDER_REGISTRY.get(key)
+
+    if prior is None or mode == "replace":
+        # No prior entry, or wholesale replace: take the new config as-is.
+        _SEEDER_REGISTRY[key] = config
+    else:  # mode == "retain_base": merge prior base model_classes into the new
+        # Preserve prior base tables that the new config does not override.
+        merged = {**prior.model_classes, **config.model_classes}
+        config.model_classes = merged
+        _SEEDER_REGISTRY[key] = config
+
     logger.debug(f"Registered seeder: {config.package_name or config.connection_name} "
-                 f"(priority={config.priority}, is_tenant={config.is_tenant_seeder})")
+                 f"(priority={config.priority}, is_tenant={config.is_tenant_seeder}, "
+                 f"mode={mode})")
 
 
 def get_registered_seeders() -> list[SeederConfig]:
@@ -192,13 +225,13 @@ def get_registered_seeders() -> list[SeederConfig]:
     Returns:
         List of all registered SeederConfig objects
     """
-    return list(_SEEDER_REGISTRY)
+    return list(_SEEDER_REGISTRY.values())
 
 
 def clear_registry() -> None:
     """Clear all registered seeders. Useful for testing."""
     global _SEEDER_REGISTRY
-    _SEEDER_REGISTRY = []
+    _SEEDER_REGISTRY = {}
 
 
 # ============================================================================
@@ -683,8 +716,8 @@ async def seed_all(
     """
     result = SeederResult()
 
-    # Sort by priority (lower = first)
-    sorted_seeders = sorted(get_registered_seeders(), key=lambda s: s.priority)
+    # Iterate registry values, sorted by priority (lower = first)
+    sorted_seeders = sorted(_SEEDER_REGISTRY.values(), key=lambda s: s.priority)
 
     for seeder in sorted_seeders:
         # Apply package filter if specified

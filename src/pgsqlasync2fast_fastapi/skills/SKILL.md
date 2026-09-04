@@ -4,7 +4,7 @@ description: "Trigger: working on or with pgsqlasync2fast-fastapi. Multi-databas
 license: MIT
 metadata:
   author: AngelDanielSanchezCastillo
-  version: "2.0"
+  version: "2.1"
 ---
 
 ## Purpose
@@ -26,6 +26,13 @@ engines/session factories keyed by connection name (`default`, `auth`,
 - `shutdown_database()` → `manager.close_all()` (disposes all engines).
 - DB ops `database_exists/create_database/drop_database/list_databases` — ALL require a superuser connection (`is_superuser=True`; first configured one wins); use AUTOCOMMIT isolation.
 - Seeder: `SeederConfig`, `register_seeder`, `seed_all`, `get_registered_seeders`, `SeederConflictError`.
+- `insert_if_missing(session, model, lookup, defaults=None)` — **shared idempotent
+  insert-if-missing** primitive: SELECT by natural-key `lookup` fields, return the
+  existing row if present or insert (merge `lookup`+`defaults`) and flush if absent.
+  Consumer packages (permissions2fast GLOBAL routes, tenants2fast TENANT routes)
+  reuse this instead of hand-rolling per package (RBAC standardization D2). No
+  commit — caller owns the transaction boundary. Also re-exported from the top-level
+  `pgsqlasync2fast_fastapi` package.
 
 ## Architecture
 

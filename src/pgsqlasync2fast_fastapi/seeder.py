@@ -235,6 +235,56 @@ def clear_registry() -> None:
 
 
 # ============================================================================
+# Idempotent insert-if-missing primitive (shared across consumer packages)
+# ============================================================================
+
+
+async def insert_if_missing(
+    session: Any,
+    model: type,
+    lookup: dict[str, Any],
+    defaults: dict[str, Any] | None = None,
+):
+    """
+    Insert a row if no row matches the natural-key ``lookup`` fields.
+
+    This is the shared, reusable idempotent **insert-if-missing** primitive.
+    Consumer packages (permissions2fast GLOBAL route seeding, tenants2fast
+    TENANT route seeding) reuse it instead of hand-rolling per package.
+
+    A ``SELECT`` by the ``lookup`` fields decides whether the row already
+    exists: if it does, the existing row is returned untouched (idempotent);
+    otherwise a new row is built from ``lookup`` merged with ``defaults``,
+    added to the session and flushed (no commit — the caller decides the
+    transaction boundary).
+
+    Args:
+        session: SQLModel AsyncSession (supports both ``exec`` and ``execute``).
+        model: SQLModel table class to query/insert.
+        lookup: Mapping of column name -> value that forms the row's natural key.
+        defaults: Optional extra column values applied only on insert.
+
+    Returns:
+        The existing (found) or newly created row instance.
+    """
+    from sqlmodel import select
+
+    stmt = select(model)
+    for col, val in lookup.items():
+        stmt = stmt.where(getattr(model, col) == val)
+    result = await session.exec(stmt)
+    existing = result.first()
+    if existing is not None:
+        return existing
+
+    merged = {**lookup, **(defaults or {})}
+    row = model(**merged)
+    session.add(row)
+    await session.flush()
+    return row
+
+
+# ============================================================================
 # Manifest and Data Loading
 # ============================================================================
 
@@ -831,4 +881,6 @@ __all__ = [
     "clear_registry",
     # Main orchestrator
     "seed_all",
+    # Shared idempotent insert-if-missing primitive
+    "insert_if_missing",
 ]

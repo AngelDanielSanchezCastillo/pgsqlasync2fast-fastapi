@@ -593,6 +593,60 @@ def _resolve_load_order(manifest: dict[str, Any]) -> list[str]:
 # ============================================================================
 
 
+async def sync_table_sequence(
+    session: Any,
+    model_class: type,
+) -> None:
+    """
+    Re-sync a PostgreSQL table identity sequence to its current MAX(id).
+
+    The seeder inserts rows with explicit ``id`` values straight from the
+    manifest JSON. PostgreSQL's plain ``serial``/``sequence``-backed columns do
+    NOT advance the sequence when a row is inserted with an explicit id, so a
+    later sequence-backed insert (e.g. ``insert_if_missing``) can generate an
+    id that collides with an existing explicit-id row (UniqueViolation).
+
+    This issues one ``setval`` to ``MAX(id)`` after the explicit-id inserts so
+    the next auto-generated id continues past the seeded rows. It only runs
+    against PostgreSQL — SQLite assigns ``INTEGER PRIMARY KEY`` as max+1
+    automatically and has no incompatible sequence catalog, so it is a no-op
+    there.
+
+    Args:
+        session: SQLModel AsyncSession bound to the target DB.
+        model_class: The SQLModel/SQLAlchemy table class to re-sync.
+    """
+    from sqlalchemy import text
+
+    try:
+        bind = getattr(session, "bind", None)
+        if bind is None:
+            return
+        dialect = getattr(bind.dialect, "name", None)
+        if dialect != "postgresql":
+            return
+
+        table = model_class.__tablename__
+        seq = f"{table}_id_seq"
+        async with bind.begin() as conn:
+            max_id = await conn.scalar(
+                text(f'SELECT COALESCE(MAX(id), 0) FROM "{table}"')
+            )
+            if max_id:
+                await conn.execute(
+                    text("SELECT setval(:seq, :val)"),
+                    {"seq": seq, "val": max_id},
+                )
+                logger.info(
+                    f"Synced sequence '{seq}' to MAX(id)={max_id} "
+                    f"(table '{table}')"
+                )
+    except Exception as exc:  # pragma: no cover - defensive, non-fatal
+        logger.warning(
+            f"Could not re-sync sequence for '{model_class.__name__}': {exc}"
+        )
+
+
 async def _seed_table_idempotent(
     session: Any,
     table_name: str,
@@ -657,6 +711,9 @@ async def _seed_table_idempotent(
             await session.rollback()
             logger.error(f"Failed to insert row in table '{table_name}': {e}")
             raise
+
+    if model_class is not None:
+        await sync_table_sequence(session, model_class)
 
     return rows_inserted, rows_skipped
 
@@ -726,6 +783,8 @@ async def _seed_table_idempotent_generic(
             await session.rollback()
             logger.error(f"Failed to insert row in table '{table_name}': {e}")
             raise
+
+    await sync_table_sequence(session, model_class)
 
     return rows_inserted, rows_skipped
 

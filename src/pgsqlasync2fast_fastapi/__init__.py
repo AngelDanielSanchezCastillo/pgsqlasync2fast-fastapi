@@ -50,6 +50,8 @@ from pgsqlasync2fast_fastapi.seeder import (
     clear_registry,
     # Main orchestrator
     seed_all,
+    # Shared idempotent insert-if-missing primitive
+    insert_if_missing,
 )
 
 __all__ = [
@@ -86,4 +88,6 @@ __all__ = [
     "clear_registry",
     # Main orchestrator (seeder)
     "seed_all",
+    # Shared idempotent insert-if-missing primitive
+    "insert_if_missing",
 ]

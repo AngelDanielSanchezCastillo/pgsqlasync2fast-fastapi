@@ -4,7 +4,7 @@ description: "Trigger: working on or with pgsqlasync2fast-fastapi. Multi-databas
 license: MIT
 metadata:
   author: AngelDanielSanchezCastillo
-  version: "1.0"
+  version: "2.1"
 ---
 
 ## Purpose
@@ -26,6 +26,13 @@ engines/session factories keyed by connection name (`default`, `auth`,
 - `shutdown_database()` → `manager.close_all()` (disposes all engines).
 - DB ops `database_exists/create_database/drop_database/list_databases` — ALL require a superuser connection (`is_superuser=True`; first configured one wins); use AUTOCOMMIT isolation.
 - Seeder: `SeederConfig`, `register_seeder`, `seed_all`, `get_registered_seeders`, `SeederConflictError`.
+- `insert_if_missing(session, model, lookup, defaults=None)` — **shared idempotent
+  insert-if-missing** primitive: SELECT by natural-key `lookup` fields, return the
+  existing row if present or insert (merge `lookup`+`defaults`) and flush if absent.
+  Consumer packages (permissions2fast GLOBAL routes, tenants2fast TENANT routes)
+  reuse this instead of hand-rolling per package (RBAC standardization D2). No
+  commit — caller owns the transaction boundary. Also re-exported from the top-level
+  `pgsqlasync2fast_fastapi` package.
 
 ## Architecture
 
@@ -51,8 +58,13 @@ Downstream imports (stable contracts): oauth2fast `get_db_session`→`partial(..
 
 ## Seeder orchestrator
 
-- `register_seeder` does registration-time **table-conflict detection** per connection (`SeederConflictError` if two seeders on the same connection share a manifest `tables` key).
-- `seed_all(profile, package_filter=None)` sorts by `priority` (LOWER first). **Skips** registered seeders with `is_tenant_seeder=True` and no `seed_fn` (warns — tenant seeding must be driven by `seed_all_tenants`/the tenant package itself).
+- The seeder registry is **keyed by `(connection_name, package_name)`** — re-registering the same key updates that single entry in place (idempotent, no duplicates).
+- `register_seeder(config, mode="retain_base")` is the **override primitive**:
+  - `mode="retain_base"` (default, backward-compatible): an existing same-key entry's config fields are replaced but its prior manifest `model_classes` are **merged** into the new config's set — base tables are preserved when an app extends a package seeder.
+  - `mode="replace"`: the prior same-key entry is replaced wholesale.
+  - Re-registering the same key NEVER raises `SeederConflictError`.
+- Registration-time **table-conflict detection** applies only to *distinct* `(connection, package)` keys: `SeederConflictError` if two different packages on the same connection share a manifest `tables` key.
+- `seed_all(profile, package_filter=None)` sorts registered values by `priority` (LOWER first). **Skips** registered seeders with `is_tenant_seeder=True` and no `seed_fn` (warns — tenant seeding must be driven by `seed_all_tenants`/the tenant package itself).
 - Generic path: topological sort of `depends_on` (cycle → `SeedValidationError`), FK resolution `fk_field_mapping`/`fk_fields`/`rstrip('s')+'_id'`, insert **per row** with explicit `id` → idempotent (SELECT by id, skip if exists, commit per row).
 
 ## Settings

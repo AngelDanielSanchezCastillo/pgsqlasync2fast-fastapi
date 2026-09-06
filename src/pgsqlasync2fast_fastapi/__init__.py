@@ -52,6 +52,8 @@ from pgsqlasync2fast_fastapi.seeder import (
     seed_all,
     # Shared idempotent insert-if-missing primitive
     insert_if_missing,
+    # Shared PostgreSQL sequence re-sync primitive
+    sync_table_sequence,
 )
 
 __all__ = [
@@ -90,4 +92,6 @@ __all__ = [
     "seed_all",
     # Shared idempotent insert-if-missing primitive
     "insert_if_missing",
+    # Shared PostgreSQL sequence re-sync primitive
+    "sync_table_sequence",
 ]

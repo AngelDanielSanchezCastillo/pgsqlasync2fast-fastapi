@@ -1,10 +1,10 @@
 ---
 name: pgsqlasync2fast-fastapi
-description: "Trigger: working on or with pgsqlasync2fast-fastapi. Multi-database async engine manager for FastAPI: DB_CONNECTIONS config, get_db_session deps, seeder orchestrator, tenant engines. Prevails over the 2fast-handbook base skill for this package."
+description: "Trigger: working on or with pgsqlasync2fast-fastapi. Multi-database async engine manager for FastAPI: DB_CONNECTIONS config, get_db_session deps, seeder orchestrator, tenant engines, shared Alembic migration runner. Prevails over the 2fast-handbook base skill for this package."
 license: MIT
 metadata:
   author: AngelDanielSanchezCastillo
-  version: "2.1"
+  version: "2.2"
 ---
 
 ## Purpose
@@ -33,6 +33,12 @@ engines/session factories keyed by connection name (`default`, `auth`,
   reuse this instead of hand-rolling per package (RBAC standardization D2). No
   commit — caller owns the transaction boundary. Also re-exported from the top-level
   `pgsqlasync2fast_fastapi` package.
+- Migration infra (`pgsqlasync2fast_fastapi.migrations`, alembic-2fast change):
+  - `ChainSpec(package, script_path, version_table, target_metadata, owned_tables)` — frozen spec of one wheel-shipped chain.
+  - `register_chain(lane, chain)` / `get_lane_chains(lane)` / `clear_chain_registry()` — lane-keyed registry, same idiom as `register_seeder` (same-key re-registration updates in place; registration order = execution order).
+  - `run_migrations(connection_name, chains)` — async runner per the OFFICIAL alembic recipe: URL config-only (`manager.config.get_connection_url`), each chain upgraded to `head` via `asyncio.to_thread`; shared `migrations/env.py` creates a fresh `async_engine_from_config` + `NullPool` engine and disposes it per run. **NEVER touches `DatabaseManager._engines`** (pooled app engines).
+  - env contract: `script_location` = `"<pkg>:<chain_path>"` resource string resolved from the INSTALLED release (alembic `coerce_resource_to_filename`), never a checkout; `version_table` read via `config.get_main_option` and passed EXPLICITLY to `context.configure(version_table=...)` (alembic 1.20.0 does not auto-transport it); include_object/include_name ownership filters admit only `owned_tables` (+ their indexes/constraints).
+  - `alembic==1.20.0` pinned EXACTLY in runtime deps (deliberate re-pin rule).
 
 ## Architecture
 

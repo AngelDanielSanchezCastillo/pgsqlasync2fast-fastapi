@@ -34,6 +34,9 @@ dependencies = [
     "sqlmodel>=0.0.22",
     "asyncpg>=0.29.0",
     "greenlet>=3.0.0",
+    # Exact pin per the alembic-2fast migration change: deliberate re-pins
+    # require a version bump and a full test run. Never use a range here.
+    "alembic==1.20.0",
 ]
 
 [dependency-groups]
@@ -72,6 +75,9 @@ version = {attr = "pgsqlasync2fast_fastapi.__version__.__version__"}
 [tool.setuptools.package-data]
 pgsqlasync2fast_fastapi = [
     "skills/*.md",
+    # Shared Alembic env implementation + any future chain data shipped as
+    # wheel package data (resolved from the installed release, never a checkout).
+    "migrations/**/*.py",
 ]
 
 [tool.pytest.ini_options]

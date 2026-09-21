@@ -56,6 +56,17 @@ from pgsqlasync2fast_fastapi.seeder import (
     sync_table_sequence,
 )
 
+# Re-export migration-specific exports
+from pgsqlasync2fast_fastapi.migrations import (
+    # Chain spec + runner
+    ChainSpec,
+    run_migrations,
+    # Lane-keyed chain registry
+    register_chain,
+    get_lane_chains,
+    clear_chain_registry,
+)
+
 __all__ = [
     # Version
     "__version__",
@@ -94,4 +105,10 @@ __all__ = [
     "insert_if_missing",
     # Shared PostgreSQL sequence re-sync primitive
     "sync_table_sequence",
+    # Migration infrastructure (alembic-2fast)
+    "ChainSpec",
+    "run_migrations",
+    "register_chain",
+    "get_lane_chains",
+    "clear_chain_registry",
 ]

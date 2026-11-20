@@ -284,6 +284,61 @@ async def insert_if_missing(
     return row
 
 
+async def upsert_by_id(
+    session: Any,
+    model: type,
+    data: dict[str, Any],
+):
+    """
+    Upsert a row by ID: update if exists, insert if not.
+
+    This is the shared, reusable idempotent **upsert** primitive.
+    Unlike ``insert_if_missing`` (which uses natural keys), this uses the
+    primary key (ID) to determine if the row exists. If it exists, all fields
+    are updated with the new values. If not, a new row is inserted.
+
+    This is useful for seeders that need to evolve over time (e.g., rename
+    roles from "Admin" to "admin").
+
+    Args:
+        session: SQLModel AsyncSession (supports both ``exec`` and ``execute``).
+        model: SQLModel table class to query/insert.
+        data: Dict with all row fields including 'id'.
+
+    Returns:
+        The existing (updated) or newly created row instance.
+
+    Raises:
+        ValueError: If 'id' is not present in data.
+    """
+    from sqlmodel import select
+
+    row_id = data.get("id")
+    if row_id is None:
+        raise ValueError("upsert_by_id requires 'id' field in data")
+
+    # Check if row exists by ID
+    result = await session.exec(
+        select(model).where(model.id == row_id)
+    )
+    existing = result.first()
+
+    if existing is not None:
+        # Update existing row
+        for key, value in data.items():
+            if key != "id" and hasattr(existing, key):
+                setattr(existing, key, value)
+        session.add(existing)
+        await session.flush()
+        return existing
+    else:
+        # Insert new row
+        row = model(**data)
+        session.add(row)
+        await session.flush()
+        return row
+
+
 # ============================================================================
 # Manifest and Data Loading
 # ============================================================================
@@ -724,13 +779,17 @@ async def _seed_table_idempotent_generic(
     rows: list[dict[str, Any]],
     model_class: type,
     fk_field_mapping: dict[str, dict[str, str]] | None = None
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """
-    Generic idempotent seed function for packages that use the orchestrator.
+    Generic upsert seed function for packages that use the orchestrator.
 
     This is used when the package doesn't provide its own seed_fn.
     The orchestrator handles all the seeding logic using the model_classes
     provided in the SeederConfig.
+
+    **Upsert behavior**: If a row with the same ID exists, it's updated with
+    the new values. If it doesn't exist, it's inserted. This allows seeders
+    to evolve over time (e.g., rename roles from "Admin" to "admin").
 
     Args:
         session: SQLModel AsyncSession
@@ -740,11 +799,12 @@ async def _seed_table_idempotent_generic(
         fk_field_mapping: Optional mapping for FK field names (JSON -> model)
 
     Returns:
-        Tuple of (rows_inserted, rows_skipped)
+        Tuple of (rows_inserted, rows_updated, rows_skipped)
     """
     from sqlmodel import select
 
     rows_inserted = 0
+    rows_updated = 0
     rows_skipped = 0
 
     # Get FK field mapping for this table if provided
@@ -767,26 +827,40 @@ async def _seed_table_idempotent_generic(
         )
         existing = result.one_or_none()
 
-        if existing is not None:
-            logger.debug(f"Skipping existing row id={row_id} in table '{table_name}'")
-            rows_skipped += 1
-            continue
-
-        # Insert new row
         try:
-            obj = model_class(**row)
-            session.add(obj)
-            await session.commit()
-            rows_inserted += 1
-            logger.debug(f"Inserted row id={row_id} in table '{table_name}'")
+            if existing is not None:
+                # UPSERT: Update existing row with new values
+                changed = False
+                for key, value in row.items():
+                    if key != "id" and hasattr(existing, key):
+                        current_value = getattr(existing, key)
+                        if current_value != value:
+                            setattr(existing, key, value)
+                            changed = True
+                
+                if changed:
+                    session.add(existing)
+                    await session.commit()
+                    rows_updated += 1
+                    logger.debug(f"Updated row id={row_id} in table '{table_name}'")
+                else:
+                    logger.debug(f"Skipping unchanged row id={row_id} in table '{table_name}'")
+                    rows_skipped += 1
+            else:
+                # INSERT: Create new row
+                obj = model_class(**row)
+                session.add(obj)
+                await session.commit()
+                rows_inserted += 1
+                logger.debug(f"Inserted row id={row_id} in table '{table_name}'")
         except Exception as e:
             await session.rollback()
-            logger.error(f"Failed to insert row in table '{table_name}': {e}")
+            logger.error(f"Failed to upsert row in table '{table_name}': {e}")
             raise
 
     await sync_table_sequence(session, model_class)
 
-    return rows_inserted, rows_skipped
+    return rows_inserted, rows_updated, rows_skipped
 
 
 # ============================================================================
@@ -897,11 +971,11 @@ async def seed_all(
                         continue
 
                     # Use generic seed logic with model classes and FK mapping
-                    inserted, skipped = await _seed_table_idempotent_generic(
+                    inserted, updated, skipped = await _seed_table_idempotent_generic(
                         session, table_name, rows, model_class,
                         fk_field_mapping=seeder.fk_field_mapping
                     )
-                    result.rows_seeded += inserted
+                    result.rows_seeded += inserted + updated
                     result.tables_seeded += 1
 
             logger.info(f"Completed seeding: {pkg_name}")
@@ -940,6 +1014,7 @@ __all__ = [
     "clear_registry",
     # Main orchestrator
     "seed_all",
-    # Shared idempotent insert-if-missing primitive
+    # Shared idempotent primitives
     "insert_if_missing",
+    "upsert_by_id",
 ]

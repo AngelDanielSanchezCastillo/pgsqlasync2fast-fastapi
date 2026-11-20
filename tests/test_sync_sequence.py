@@ -193,9 +193,10 @@ async def test_generic_seeder_calls_sync_sequence():
         "pgsqlasync2fast_fastapi.seeder.sync_table_sequence",
         new=AsyncMock(),
     ) as mock_sync:
-        inserted, skipped = await _seed_table_idempotent_generic(
+        inserted, updated, skipped = await _seed_table_idempotent_generic(
             session, "seq_fruits", [{"id": 1, "name": "apple"}], SeqFruit
         )
 
     assert inserted == 1
+    assert updated == 0
     mock_sync.assert_awaited_once_with(session, SeqFruit)

@@ -36,7 +36,7 @@ dependencies = [
     "greenlet>=3.0.0",
     # Exact pin per the alembic-2fast migration change: deliberate re-pins
     # require a version bump and a full test run. Never use a range here.
-    "alembic==1.20.0",
+    "alembic>=1.20.0",
 ]
 
 [dependency-groups]

@@ -8,7 +8,7 @@ This module provides the foundation for the seeder standard, including:
 - SeederConfig: Configuration dataclass for package seeders
 - register_seeder(): Register a package's seeder with conflict detection
 - seed_all(): Execute all registered seeders in dependency order
-- Idempotent seeding: rows are skipped if they already exist by ID
+- Idempotent upsert seeding: rows are updated when they exist by ID, inserted otherwise
 
 Example usage:
     from pgsqlasync2fast_fastapi import seed_all, register_seeder, SeederConfig
@@ -700,77 +700,6 @@ async def sync_table_sequence(
         logger.warning(
             f"Could not re-sync sequence for '{model_class.__name__}': {exc}"
         )
-
-
-async def _seed_table_idempotent(
-    session: Any,
-    table_name: str,
-    rows: list[dict[str, Any]],
-    model_class: type | None = None
-) -> tuple[int, int]:
-    """
-    Seed a table idempotently by checking if rows exist by ID.
-
-    This function is idempotent - running it multiple times with the same
-    data produces the same result (no duplicates).
-
-    Args:
-        session: SQLModel AsyncSession
-        table_name: Name of the table (for logging)
-        rows: List of row dictionaries with explicit IDs
-        model_class: SQLModel class for the table (optional for custom handling)
-
-    Returns:
-        Tuple of (rows_inserted, rows_skipped)
-    """
-    from sqlmodel import select
-
-    rows_inserted = 0
-    rows_skipped = 0
-
-    for row in rows:
-        row_id = row.get("id")
-        if row_id is None:
-            logger.warning(f"Skipping row without ID in table '{table_name}'")
-            rows_skipped += 1
-            continue
-
-        # Check if row already exists by ID
-        if model_class is not None:
-            result = await session.exec(
-                select(model_class).where(model_class.id == row_id)
-            )
-            existing = result.one_or_none()
-        else:
-            # Fallback: assume table has 'id' column
-            existing = None
-
-        if existing is not None:
-            logger.debug(f"Skipping existing row id={row_id} in table '{table_name}'")
-            rows_skipped += 1
-            continue
-
-        # Insert new row
-        try:
-            if model_class is not None:
-                obj = model_class(**row)
-                session.add(obj)
-                await session.commit()
-                rows_inserted += 1
-                logger.debug(f"Inserted row id={row_id} in table '{table_name}'")
-            else:
-                # Cannot insert without model class - skip
-                logger.warning(f"Cannot insert without model class for table '{table_name}'")
-                rows_skipped += 1
-        except Exception as e:
-            await session.rollback()
-            logger.error(f"Failed to insert row in table '{table_name}': {e}")
-            raise
-
-    if model_class is not None:
-        await sync_table_sequence(session, model_class)
-
-    return rows_inserted, rows_skipped
 
 
 async def _seed_table_idempotent_generic(

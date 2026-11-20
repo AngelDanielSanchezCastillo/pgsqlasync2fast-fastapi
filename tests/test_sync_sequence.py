@@ -11,8 +11,7 @@ collides with an existing explicit-id row (UniqueViolation).
 This module verifies:
 1. ``sync_table_sequence`` is a no-op on non-PostgreSQL dialects (SQLite).
 2. On PostgreSQL it issues ``setval`` to the table's ``MAX(id)``.
-3. Both seeding paths (``_seed_table_idempotent`` and
-   ``_seed_table_idempotent_generic``) call the primitive.
+3. The generic seeder (``_seed_table_idempotent_generic``) calls the primitive.
 
 Run with:
   cd /Volumes/Desarrollo/Repos/Github/pgsqlasync2fast-fastapi \
@@ -147,33 +146,8 @@ async def test_sync_sequence_skips_setval_when_table_empty():
 
 
 # ============================================================================
-# Unit: both seeding paths invoke the primitive
+# Unit: the seeding path invokes the primitive
 # ============================================================================
-
-
-@pytest.mark.asyncio
-async def test_idempotent_seeder_calls_sync_sequence():
-    """_seed_table_idempotent invokes sync_table_sequence at the end."""
-    from pgsqlasync2fast_fastapi.seeder import _seed_table_idempotent
-
-    session = AsyncMock()
-    exec_result = MagicMock()
-    exec_result.one_or_none = MagicMock(return_value=None)
-    session.exec = AsyncMock(return_value=exec_result)
-    session.add = MagicMock()
-    session.commit = AsyncMock()
-    session.rollback = AsyncMock()
-
-    with patch(
-        "pgsqlasync2fast_fastapi.seeder.sync_table_sequence",
-        new=AsyncMock(),
-    ) as mock_sync:
-        inserted, skipped = await _seed_table_idempotent(
-            session, "seq_fruits", [{"id": 1, "name": "apple"}], SeqFruit
-        )
-
-    assert inserted == 1
-    mock_sync.assert_awaited_once_with(session, SeqFruit)
 
 
 @pytest.mark.asyncio

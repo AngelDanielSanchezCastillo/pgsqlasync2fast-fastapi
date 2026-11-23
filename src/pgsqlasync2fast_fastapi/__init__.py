@@ -67,6 +67,13 @@ from pgsqlasync2fast_fastapi.migrations import (
     clear_chain_registry,
 )
 
+# Re-export migration helpers (DEPRECATED - for v0.x → v1.0 migrations only)
+from pgsqlasync2fast_fastapi.migration_helpers import (
+    migrate_pk_to_uuid,
+    migrate_fk_to_uuid,
+    backfill_uuids,
+)
+
 __all__ = [
     # Version
     "__version__",
@@ -111,4 +118,8 @@ __all__ = [
     "register_chain",
     "get_lane_chains",
     "clear_chain_registry",
+    # Migration helpers (DEPRECATED)
+    "migrate_pk_to_uuid",
+    "migrate_fk_to_uuid",
+    "backfill_uuids",
 ]

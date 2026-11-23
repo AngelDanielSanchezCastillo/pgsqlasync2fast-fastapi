@@ -6,60 +6,12 @@ They will be removed in 5 minor versions (around version 0.10.0).
 Use these helpers only when migrating existing databases from BigInteger to UUID.
 New databases should use UUIDIdMixin from the start.
 """
-import os
-import time
 import warnings
 from typing import List
-from uuid import UUID
+from uuid import UUID, uuid7
 
 from sqlalchemy import text
 from sqlmodel.ext.asyncio.session import AsyncSession
-
-
-def uuid7() -> UUID:
-    """
-    Generate a UUID version 7 (time-ordered).
-    
-    UUID v7 structure (RFC 9562):
-    - 48 bits: Unix timestamp in milliseconds
-    - 4 bits: version (0111 = 7)
-    - 12 bits: random
-    - 2 bits: variant (10)
-    - 62 bits: random
-    
-    Returns:
-        UUID version 7
-    """
-    # Get current timestamp in milliseconds (48 bits)
-    timestamp_ms = int(time.time() * 1000) & 0xFFFFFFFFFFFF
-    
-    # Generate 10 bytes of random data (80 bits)
-    random_bytes = os.urandom(10)
-    random_int = int.from_bytes(random_bytes, 'big')
-    
-    # Construct the UUID (128 bits total)
-    # Bits 0-47: timestamp (48 bits)
-    # Bits 48-51: version (4 bits) = 0111
-    # Bits 52-63: random (12 bits)
-    # Bits 64-65: variant (2 bits) = 10
-    # Bits 66-127: random (62 bits)
-    
-    # Start with timestamp in the high 48 bits
-    uuid_int = timestamp_ms << 80
-    
-    # Add version (0111) at bits 48-51
-    uuid_int |= (0b0111 << 76)
-    
-    # Add random bits at bits 52-63 (12 bits)
-    uuid_int |= (random_int & 0xFFF) << 64
-    
-    # Add variant (10) at bits 64-65
-    uuid_int |= (0b10 << 62)
-    
-    # Add random bits at bits 66-127 (62 bits)
-    uuid_int |= (random_int >> 12) & 0x3FFFFFFFFFFFFFFF
-    
-    return UUID(int=uuid_int)
 
 
 async def migrate_pk_to_uuid(

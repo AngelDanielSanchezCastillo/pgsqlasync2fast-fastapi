@@ -225,3 +225,161 @@ async def backfill_uuids(
     
     await session.commit()
     return count
+
+
+# ============================================================================
+# Alembic-specific helpers (synchronous, using op object)
+# ============================================================================
+
+
+def add_soft_delete_columns_alembic(op_obj, table_name: str) -> None:
+    """
+    Add soft-delete columns (deleted_at, deleted_by) to a table using Alembic.
+    
+    Args:
+        op_obj: Alembic operations object
+        table_name: Name of the table to modify
+    """
+    import sqlalchemy as sa
+    
+    op_obj.add_column(
+        table_name,
+        sa.Column(
+            'deleted_at',
+            sa.DateTime(timezone=True),
+            nullable=True,
+            comment='Timestamp when the record was soft-deleted. None means active.',
+        ),
+    )
+    op_obj.add_column(
+        table_name,
+        sa.Column(
+            'deleted_by',
+            sa.UUID(),
+            nullable=True,
+            comment='ID of the user who soft-deleted this record.',
+        ),
+    )
+    # Add index on deleted_at for efficient filtering
+    op_obj.create_index(
+        f'ix_{table_name}_deleted_at',
+        table_name,
+        ['deleted_at'],
+        unique=False,
+    )
+
+
+def migrate_pk_to_uuid_alembic(op_obj, table_name: str) -> None:
+    """
+    Migrate a table's primary key from BigInteger to UUID using Alembic.
+    
+    This function:
+    1. Adds a new UUID column (id_uuid)
+    2. Backfills with UUID v4 values for existing rows (using gen_random_uuid())
+    3. Swaps the old PK column with the new UUID column
+    4. Recreates constraints and indexes
+    
+    Args:
+        op_obj: Alembic operations object
+        table_name: Name of the table to migrate
+    
+    Warning:
+        This is a destructive operation. Backup your database before running.
+        Foreign key relationships must be handled separately using migrate_fk_to_uuid_alembic().
+    """
+    import sqlalchemy as sa
+    
+    # Step 1: Add UUID column
+    op_obj.add_column(table_name, sa.Column('id_uuid', sa.Uuid(), nullable=True))
+    
+    # Step 2: Backfill UUIDs for existing rows using gen_random_uuid()
+    op_obj.execute(f"UPDATE {table_name} SET id_uuid = gen_random_uuid() WHERE id_uuid IS NULL")
+    
+    # Step 3: Make UUID column NOT NULL
+    op_obj.alter_column(table_name, 'id_uuid', nullable=False,
+                        existing_type=sa.Uuid(), existing_nullable=True)
+    
+    # Step 4: Drop old primary key constraint
+    op_obj.drop_constraint(f'{table_name}_pkey', table_name)
+    
+    # Step 5: Drop old id column
+    op_obj.drop_column(table_name, 'id')
+    
+    # Step 6: Rename UUID column to id
+    op_obj.alter_column(table_name, 'id_uuid', new_column_name='id')
+    
+    # Step 7: Recreate primary key
+    op_obj.create_primary_key(f'{table_name}_pkey', table_name, ['id'])
+    
+    # Step 8: Recreate index
+    op_obj.create_index(op_obj.f(f'ix_{table_name}_id'), table_name, ['id'], unique=False)
+
+
+def migrate_fk_to_uuid_alembic(
+    op_obj,
+    table_name: str,
+    fk_column: str,
+    referenced_table: str,
+) -> None:
+    """
+    Migrate a foreign key column from BigInteger to UUID using Alembic.
+    
+    This function:
+    1. Adds a new UUID column for the FK
+    2. Backfills with UUIDs from the referenced table
+    3. Drops the old FK column
+    4. Renames the new column
+    5. Recreates the foreign key constraint
+    
+    Args:
+        op_obj: Alembic operations object
+        table_name: Name of the table containing the FK
+        fk_column: Name of the FK column to migrate
+        referenced_table: Name of the table being referenced
+    
+    Warning:
+        This is a destructive operation. Backup your database before running.
+    """
+    import sqlalchemy as sa
+    
+    new_column = f"{fk_column}_uuid"
+    constraint_name = f"{table_name}_{fk_column}_fkey"
+    
+    # Step 1: Add UUID column
+    op_obj.add_column(table_name, sa.Column(new_column, sa.Uuid(), nullable=True))
+    
+    # Step 2: Backfill UUIDs from referenced table
+    op_obj.execute(f"""
+        UPDATE {table_name}
+        SET {new_column} = (
+            SELECT id FROM {referenced_table}
+            WHERE {referenced_table}.id = {table_name}.{fk_column}
+        )
+        WHERE {new_column} IS NULL
+    """)
+    
+    # Step 3: Make UUID column NOT NULL
+    op_obj.alter_column(table_name, new_column, nullable=False,
+                        existing_type=sa.Uuid(), existing_nullable=True)
+    
+    # Step 4: Drop old FK constraint
+    op_obj.drop_constraint(constraint_name, table_name, type_='foreignkey')
+    
+    # Step 5: Drop old FK column
+    op_obj.drop_column(table_name, fk_column)
+    
+    # Step 6: Rename new column
+    op_obj.alter_column(table_name, new_column, new_column_name=fk_column)
+    
+    # Step 7: Recreate FK constraint
+    op_obj.create_foreign_key(
+        constraint_name,
+        table_name,
+        referenced_table,
+        [fk_column],
+        ['id'],
+    )
+    
+    # Step 8: Recreate index
+    op_obj.create_index(op_obj.f(f'ix_{table_name}_{fk_column}'), table_name, [fk_column], unique=False)
+

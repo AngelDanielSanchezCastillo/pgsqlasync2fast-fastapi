@@ -357,6 +357,7 @@ def finalize_uuid_alembic(
     *,
     pk_tables,
     fk_relations,
+    unique_constraints=(),
 ) -> None:
     """
     Phase 2 of the BigInteger → UUID migration (Alembic).
@@ -372,12 +373,17 @@ def finalize_uuid_alembic(
     3. For each FK relation: drop the old integer FK column (its index
        cascade-drops), rename ``<fk>_uuid`` → ``<fk>``, recreate the FK
        constraint and the ``ix_<table>_<fk>`` index.
+    4. Recreate any multi-column UNIQUE constraints (e.g.
+       ``uq_permission_roles_role_permission``) that were dropped when their
+       integer columns were removed.
 
     Args:
         op_obj: Alembic operations object.
         pk_tables: Iterable of table names whose PK was prepared.
         fk_relations: Iterable of ``(child_table, fk_column, parent_table)``
             tuples whose FK was prepared.
+        unique_constraints: Iterable of ``(table, name, columns)`` tuples to
+            recreate after the column swap.
     """
     fk_relations = list(fk_relations)
     pk_tables = list(pk_tables)
@@ -416,5 +422,45 @@ def finalize_uuid_alembic(
             [fk_column],
             unique=False,
         )
+
+    # Step 4: recreate multi-column UNIQUE constraints dropped in the swap.
+    for table, name, columns in unique_constraints:
+        op_obj.create_unique_constraint(name, table, list(columns))
+
+
+def convert_unique_column_to_uuid_alembic(
+    op_obj,
+    table_name: str,
+    column_name: str,
+) -> None:
+    """
+    Convert a plain (non-PK, non-FK) unique column from BigInteger to UUID.
+
+    Useful for columns that reference an ID owned by another database (e.g.
+    ``users.auth_user_id`` in a tenant DB pointing at the auth ``users.id``)
+    where no local FK row is available for a join-based backfill. The old
+    integer values cannot be mapped to the external UUID space, so existing
+    values are dropped (the column becomes NULL, which is valid for a unique
+    index); fresh/empty databases are unaffected.
+
+    The old unique index is dropped before the column swap and recreated as a
+    unique UUID index afterwards.
+
+    Args:
+        op_obj: Alembic operations object.
+        table_name: Table owning the column.
+        column_name: Unique column being converted.
+    """
+    import sqlalchemy as sa
+
+    new_column = f"{column_name}_uuid"
+    index_name = op_obj.f(f"ix_{table_name}_{column_name}")
+
+    op_obj.add_column(table_name, sa.Column(new_column, sa.Uuid(), nullable=True))
+    op_obj.drop_index(index_name, table_name=table_name)
+    op_obj.drop_column(table_name, column_name)
+    op_obj.alter_column(table_name, new_column, new_column_name=column_name)
+    op_obj.create_index(index_name, table_name, [column_name], unique=True)
+
 
 

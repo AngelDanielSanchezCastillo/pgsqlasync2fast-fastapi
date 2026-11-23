@@ -37,6 +37,12 @@ class _Recorder:
     def create_index(self, name, table, columns, unique=False):
         self.calls.append(("create_index", table, name, tuple(columns), unique))
 
+    def drop_index(self, name, table_name=None):
+        self.calls.append(("drop_index", table_name, name))
+
+    def create_unique_constraint(self, name, table, columns):
+        self.calls.append(("create_unique_constraint", table, name, tuple(columns)))
+
     def names(self):
         return [c[0] for c in self.calls]
 
@@ -145,3 +151,46 @@ def test_finalize_recreates_indexes():
         ("role_id",),
         False,
     ) in rec.calls
+
+
+def test_finalize_recreates_unique_constraints():
+    from pgsqlasync2fast_fastapi.migration_helpers import finalize_uuid_alembic
+
+    rec = _Recorder()
+    finalize_uuid_alembic(
+        rec,
+        pk_tables=["permission_roles"],
+        fk_relations=[
+            ("permission_roles", "role_id", "roles"),
+            ("permission_roles", "permission_id", "permissions"),
+        ],
+        unique_constraints=[
+            (
+                "permission_roles",
+                "uq_permission_roles_role_permission",
+                ("role_id", "permission_id"),
+            )
+        ],
+    )
+
+    assert (
+        "create_unique_constraint",
+        "permission_roles",
+        "uq_permission_roles_role_permission",
+        ("role_id", "permission_id"),
+    ) in rec.calls
+
+
+def test_convert_unique_column_swaps_and_recreates_unique_index():
+    from pgsqlasync2fast_fastapi.migration_helpers import (
+        convert_unique_column_to_uuid_alembic,
+    )
+
+    rec = _Recorder()
+    convert_unique_column_to_uuid_alembic(rec, "users", "auth_user_id")
+
+    assert ("add_column", "users", "auth_user_id_uuid") in rec.calls
+    assert ("drop_index", "users", "ix_users_auth_user_id") in rec.calls
+    assert ("drop_column", "users", "auth_user_id") in rec.calls
+    # Recreated as a UNIQUE index after the swap.
+    assert ("create_index", "users", "ix_users_auth_user_id", ("auth_user_id",), True) in rec.calls

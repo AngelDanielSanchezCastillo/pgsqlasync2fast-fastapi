@@ -741,6 +741,33 @@ async def rollback_table(
 # ============================================================================
 
 
+def _coerce_row_types(model: type, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Coerce JSON string values into UUID objects for UUID columns."""
+    from sqlalchemy import Uuid
+
+    uuid_columns = {
+        column.name
+        for column in model.__table__.columns
+        if isinstance(getattr(column.type, "impl", column.type), Uuid)
+        or isinstance(column.type, Uuid)
+    }
+    if not uuid_columns:
+        return rows
+
+    for row in rows:
+        for column_name in uuid_columns:
+            value = row.get(column_name)
+            if isinstance(value, str):
+                try:
+                    row[column_name] = UUID(value)
+                except ValueError as exc:
+                    raise SeedValidationError(
+                        f"Invalid UUID {value!r} for {model.__tablename__}."
+                        f"{column_name}"
+                    ) from exc
+    return rows
+
+
 def _pk_is_uuid(model: type) -> bool:
     """True when the model primary key column is a UUID."""
     from sqlalchemy import Uuid
@@ -1160,7 +1187,7 @@ class SeederEngine:
             resolved = resolve_polymorphic_fk(
                 table_name, resolved, fk_maps, polymorphic
             )
-        return resolved
+        return _coerce_row_types(model, resolved)
 
     def _resolve_references(
         self,
@@ -1575,6 +1602,169 @@ async def seed_all(
 
 
 # ============================================================================
+# Explicit-ID Adoption (migrate existing rows to manifest literals)
+# ============================================================================
+
+
+@dataclass
+class IdRemap:
+    """One row whose primary key will change from ``old_id`` to ``new_id``."""
+
+    table: str
+    old_id: Any
+    new_id: Any
+
+
+async def adopt_explicit_ids(
+    session: Any,
+    seeder: "SeederEngine",
+    layer: str = "boot",
+    *,
+    dry_run: bool = False,
+) -> list[IdRemap]:
+    """
+    Migrate existing rows to the explicit literal ids declared in the manifest.
+
+    Matches rows by each table's declared ``natural_key`` (e.g. ``name``).
+    For rows whose stored id differs from the manifest literal:
+
+    1. Park the old natural-key values (frees UNIQUE constraints).
+    2. Insert new rows carrying the manifest literal ids.
+    3. Cascade every inbound FK to the new ids (metadata introspection).
+    4. Delete the old rows.
+
+    The caller owns the transaction boundary (commit/rollback), so a failure
+    never leaves a half-migrated database.
+
+    Args:
+        session: Async session bound to the target database.
+        seeder: ``SeederEngine`` whose manifest holds the literal ids.
+        layer: Manifest layer to read ("boot" by default).
+        dry_run: When True, only compute and return the plan (no writes).
+
+    Returns:
+        The list of ``IdRemap`` entries (empty when already adopted).
+    """
+    from sqlalchemy import update
+    from sqlmodel import select
+
+    tables_cfg = seeder._get_layer_tables(layer)
+
+    loaded: dict[str, list[dict[str, Any]]] = {}
+    for table_name, cfg in tables_cfg.items():
+        rows = seeder._load_table_data(table_name, cfg)
+        if rows:
+            rows = _coerce_row_types(seeder.model_registry[table_name], rows)
+            loaded[table_name] = rows
+
+    if not loaded:
+        return []
+
+    plan: dict[str, list[tuple[dict[str, Any], Any]]] = {}
+    remaps: list[IdRemap] = []
+
+    for table_name, rows in loaded.items():
+        cfg = tables_cfg.get(table_name, {})
+        natural_key = _normalize_natural_key(cfg.get("natural_key"))
+        if not natural_key:
+            continue
+        model = seeder.model_registry[table_name]
+
+        for seed_row in rows:
+            new_id = seed_row.get("id")
+            if new_id is None:
+                continue
+            stmt = select(model)
+            for key in natural_key:
+                stmt = stmt.where(getattr(model, key) == seed_row[key])
+            obj = (await session.execute(stmt)).scalars().first()
+            if obj is None:
+                continue  # row will be inserted by the normal seed run
+            old_id = getattr(obj, "id")
+            if old_id == new_id:
+                continue  # already adopted
+            plan.setdefault(table_name, []).append((seed_row, obj))
+            remaps.append(IdRemap(table_name, old_id, new_id))
+
+    if dry_run or not remaps:
+        return remaps
+
+    dependencies = seeder._resolve_dependencies(list(plan.keys()), layer)
+    order = topological_sort(dependencies)
+
+    # 1. Park natural keys of the old rows so inserting new rows with the same
+    #    natural key does not violate UNIQUE constraints.
+    for table_name in order:
+        pairs = plan.get(table_name, [])
+        if not pairs:
+            continue
+        cfg = tables_cfg[table_name]
+        natural_key = _normalize_natural_key(cfg.get("natural_key")) or []
+        for index, (_seed_row, obj) in enumerate(pairs):
+            for key in natural_key:
+                setattr(obj, key, f"__migr_{index}_{key}")
+            session.add(obj)
+    await session.flush()
+
+    # 2. Insert new rows with the literal ids (copy stored values, then apply
+    #    the manifest row so seed values win).
+    for table_name in order:
+        pairs = plan.get(table_name, [])
+        if not pairs:
+            continue
+        cfg = tables_cfg[table_name]
+        natural_key = _normalize_natural_key(cfg.get("natural_key")) or []
+        field_mapping = cfg.get("field_mapping", {})
+        reference_sources = set(cfg.get("references", {}).keys())
+        model = seeder.model_registry[table_name]
+
+        for seed_row, obj in pairs:
+            data = {
+                column.name: getattr(obj, column.name)
+                for column in model.__table__.columns
+                if column.name != "id"
+            }
+            for key, value in seed_row.items():
+                mapped = field_mapping.get(key, key)
+                if mapped in reference_sources:
+                    continue
+                if mapped in data or mapped == "id":
+                    data[mapped] = value
+            data["id"] = seed_row["id"]
+            session.add(model(**data))
+    await session.flush()
+
+    # 3. Cascade inbound FKs from old ids to new ids.
+    metadata = next(iter(seeder.model_registry.values())).__table__.metadata
+    for remap_table, pairs in plan.items():
+        model = seeder.model_registry[remap_table]
+        target_name = model.__tablename__
+        id_map = {getattr(obj, "id"): seed_row["id"] for seed_row, obj in pairs}
+
+        for table in metadata.tables.values():
+            for column in table.columns:
+                if not column.foreign_keys:
+                    continue
+                if all(fk.column.table.name != target_name for fk in column.foreign_keys):
+                    continue
+                for old_id, new_id in id_map.items():
+                    await session.execute(
+                        update(table)
+                        .where(column == old_id)
+                        .values({column.name: new_id})
+                    )
+
+    # 4. Delete old rows (children were already repointed).
+    for table_name in reversed(order):
+        model = seeder.model_registry[table_name]
+        for _seed_row, obj in plan.get(table_name, []):
+            await session.delete(obj)
+    await session.flush()
+
+    return remaps
+
+
+# ============================================================================
 # Exports
 # ============================================================================
 
@@ -1614,4 +1804,7 @@ __all__ = [
     "validate_seeders",
     "validate_seeders_report",
     "seed_all",
+    # Explicit-id adoption migration
+    "adopt_explicit_ids",
+    "IdRemap",
 ]

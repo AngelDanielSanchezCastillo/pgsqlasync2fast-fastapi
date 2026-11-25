@@ -60,6 +60,7 @@ from pgsqlasync2fast_fastapi.seeder import (
 # ``pgsqlasync2fast_fastapi.seeders`` directly for the full API, including
 # ``SeedValidationError`` (which would clash with the legacy one here).
 from pgsqlasync2fast_fastapi.seeders import (
+    IdRemap,
     PackageSeederConfig,
     PackageSeederConflictError,
     SeederEngine,
@@ -70,6 +71,7 @@ from pgsqlasync2fast_fastapi.seeders import (
     build_all_fk_maps,
     build_fk_map,
     clear_package_registry,
+    adopt_explicit_ids,
     get_registered_packages,
     register_package_seeders,
     resolve_fks,
@@ -164,6 +166,9 @@ __all__ = [
     "validate_seeders",
     "validate_seeders_report",
     "ValidationReport",
+    # Explicit-id adoption migration
+    "adopt_explicit_ids",
+    "IdRemap",
     # Migration infrastructure (alembic-2fast)
     "ChainSpec",
     "run_migrations",

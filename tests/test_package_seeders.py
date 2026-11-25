@@ -391,3 +391,150 @@ class TestSeedAll:
         results = await seed_all("dev", engine_resolver=lambda connection: eng)
         assert list(results.keys()) == ["early", "late"]
         await eng.dispose()
+
+
+# ============================================================
+# Composition: additive base + app overrides / opt-out
+# ============================================================
+
+
+async def _sqlite_engine():
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import StaticPool
+
+    eng = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with eng.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+    return eng
+
+
+class TestSeederComposition:
+    @pytest.mark.asyncio
+    async def test_additive_packages_all_run(self, tmp_path):
+        from pgsqlasync2fast_fastapi.seeders import (
+            PackageSeederConfig,
+            register_package_seeders,
+            seed_all,
+        )
+
+        path_roles = write_package(
+            tmp_path / "roles",
+            tables={"roles": {"file": "roles.json"}},
+            data={"roles.json": [{"id": 1, "name": "Admin"}]},
+        )
+        path_perms = write_package(
+            tmp_path / "perms",
+            tables={"permissions": {"file": "permissions.json"}},
+            data={"permissions.json": [{"id": 1, "name": "read"}]},
+        )
+        register_package_seeders(PackageSeederConfig(
+            package_name="base", manifest_path=path_roles,
+            model_registry=REGISTRY, connection="auth", priority=10,
+        ))
+        register_package_seeders(PackageSeederConfig(
+            package_name="app", manifest_path=path_perms,
+            model_registry=REGISTRY, connection="auth", priority=20,
+        ))
+
+        eng = await _sqlite_engine()
+        results = await seed_all("dev", engine_resolver=lambda _c: eng)
+        assert set(results) == {"base", "app"}
+        assert results["base"].rows_inserted == 1
+        assert results["app"].rows_inserted == 1
+        await eng.dispose()
+
+    @pytest.mark.asyncio
+    async def test_override_takes_table_over(self, tmp_path):
+        from pgsqlasync2fast_fastapi.seeders import (
+            PackageSeederConfig,
+            register_package_seeders,
+            seed_all,
+        )
+
+        path_base = write_package(
+            tmp_path / "base",
+            tables={"roles": {"file": "roles.json"}},
+            data={"roles.json": [{"id": 1, "name": "BaseAdmin"}]},
+        )
+        path_app = write_package(
+            tmp_path / "app",
+            tables={
+                "roles": {"file": "roles.json"},
+                "permissions": {"file": "permissions.json"},
+            },
+            data={
+                "roles.json": [{"id": 1, "name": "AppAdmin"}],
+                "permissions.json": [{"id": 1, "name": "read"}],
+            },
+        )
+        register_package_seeders(PackageSeederConfig(
+            package_name="base", manifest_path=path_base,
+            model_registry=REGISTRY, connection="auth", priority=10,
+        ))
+        register_package_seeders(PackageSeederConfig(
+            package_name="app", manifest_path=path_app,
+            model_registry=REGISTRY, connection="auth", priority=20,
+            overrides=["roles"],
+        ))
+
+        eng = await _sqlite_engine()
+        results = await seed_all("dev", engine_resolver=lambda _c: eng)
+        # base lost its only table -> not run; app owns roles + permissions
+        assert "base" not in results
+        assert results["app"].rows_inserted == 2
+
+        maker = sessionmaker(eng, class_=AsyncSession, expire_on_commit=False)
+        async with maker() as s:
+            roles = (await s.execute(select(Role))).scalars().all()
+            assert [r.name for r in roles] == ["AppAdmin"]
+        await eng.dispose()
+
+    @pytest.mark.asyncio
+    async def test_disable_package_skips_it(self, tmp_path):
+        from pgsqlasync2fast_fastapi.seeders import (
+            PackageSeederConfig,
+            register_package_seeders,
+            disable_package_seeders,
+            seed_all,
+        )
+
+        path = write_package(
+            tmp_path,
+            tables={"roles": {"file": "roles.json"}},
+            data={"roles.json": [{"id": 1, "name": "Admin"}]},
+        )
+        register_package_seeders(PackageSeederConfig(
+            package_name="base", manifest_path=path,
+            model_registry=REGISTRY, connection="auth",
+        ))
+        disable_package_seeders("base")
+
+        eng = await _sqlite_engine()
+        results = await seed_all("dev", engine_resolver=lambda _c: eng)
+        assert results == {}
+        await eng.dispose()
+
+    @pytest.mark.asyncio
+    async def test_exclude_packages_for_one_run(self, tmp_path):
+        from pgsqlasync2fast_fastapi.seeders import (
+            PackageSeederConfig,
+            register_package_seeders,
+            seed_all,
+        )
+
+        path = write_package(
+            tmp_path,
+            tables={"roles": {"file": "roles.json"}},
+            data={"roles.json": [{"id": 1, "name": "Admin"}]},
+        )
+        register_package_seeders(PackageSeederConfig(
+            package_name="base", manifest_path=path,
+            model_registry=REGISTRY, connection="auth",
+        ))
+        eng = await _sqlite_engine()
+        assert await seed_all("dev", engine_resolver=lambda _c: eng, exclude_packages=["base"]) == {}
+        await eng.dispose()

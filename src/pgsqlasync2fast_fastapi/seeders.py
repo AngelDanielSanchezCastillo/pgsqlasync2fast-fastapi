@@ -1409,6 +1409,11 @@ class PackageSeederConfig:
     priority: int = 50
     layer: str = "boot"
     description: str = ""
+    #: When True this package's seeders are skipped by ``seed_all``.
+    disabled: bool = False
+    #: Tables this package is allowed to take over from another package on the
+    #: same connection (explicit override instead of a conflict error).
+    overrides: list[str] = field(default_factory=list)
 
 
 _PACKAGE_REGISTRY: dict[str, PackageSeederConfig] = {}
@@ -1450,11 +1455,15 @@ def register_package_seeders(config: PackageSeederConfig) -> None:
             config.manifest_path
         )
         if overlap:
-            raise PackageSeederConflictError(
-                f"Tables {sorted(overlap)} conflict between "
-                f"'{existing.package_name}' and '{config.package_name}' "
-                f"on connection '{config.connection}'"
-            )
+            allowed = set(config.overrides) | set(existing.overrides)
+            unresolved = overlap - allowed
+            if unresolved:
+                raise PackageSeederConflictError(
+                    f"Tables {sorted(unresolved)} conflict between "
+                    f"'{existing.package_name}' and '{config.package_name}' "
+                    f"on connection '{config.connection}' (declare them in "
+                    f"overrides to take ownership)"
+                )
 
     _PACKAGE_REGISTRY[config.package_name] = config
     logger.debug(
@@ -1551,26 +1560,82 @@ def validate_seeders_report(
     )
 
 
+def _resolve_effective_tables(
+    packages: list[PackageSeederConfig],
+) -> dict[str, set[str]]:
+    """
+    Resolve which package owns each (connection, table) pair.
+
+    Base packages claim their tables by priority; a package may take a table
+    over by declaring it in ``overrides``. The winner is the only package that
+    seeds that table, so an app can add its own seeders or replace a package's
+    table without duplicate writes.
+    """
+    owners: dict[tuple[str, str], PackageSeederConfig] = {}
+    for config in sorted(packages, key=lambda c: c.priority):
+        if config.disabled:
+            continue
+        for table in _manifest_all_tables(config.manifest_path):
+            key = (config.connection, table)
+            owner = owners.get(key)
+            if owner is None:
+                owners[key] = config
+            elif table in config.overrides:
+                owners[key] = config
+            elif table in owner.overrides:
+                continue  # existing owner keeps it
+            else:
+                owners[key] = config
+
+    effective: dict[str, set[str]] = {}
+    for (_, table), config in owners.items():
+        effective.setdefault(config.package_name, set()).add(table)
+    return effective
+
+
+def set_package_enabled(package_name: str, enabled: bool) -> None:
+    """Enable or disable a registered package's seeders."""
+    config = _PACKAGE_REGISTRY.get(package_name)
+    if config is None:
+        raise KeyError(f"Package seeder not registered: {package_name}")
+    config.disabled = not enabled
+
+
+def disable_package_seeders(package_name: str) -> None:
+    """Skip a package's seeders in ``seed_all`` (e.g. app fully replaces them)."""
+    set_package_enabled(package_name, False)
+
+
+def enable_package_seeders(package_name: str) -> None:
+    """Re-enable a previously disabled package's seeders."""
+    set_package_enabled(package_name, True)
+
+
 async def seed_all(
     profile: str,
     *,
     engine_resolver: Any = None,
     layer: str = "boot",
     package_filter: list[str] | None = None,
+    include_packages: list[str] | None = None,
+    exclude_packages: list[str] | None = None,
 ) -> dict[str, SeedingResult]:
     """
     Execute every registered package's seeder in priority order.
 
-    Each package is seeded through its own ``SeederEngine`` on the package's
-    configured connection. This is the app-facing entry point: packages that
-    registered themselves at import time are seeded automatically.
+    Composition rules:
+    - all non-disabled packages run (additive base)
+    - a package can take a table over via ``overrides``
+    - callers can include/exclude packages for this run
+    - disabled packages are skipped entirely
 
     Args:
         profile: Profile to seed (e.g. "dev", "prod").
-        engine_resolver: ``Callable[[connection_name], AsyncEngine]``. When
-            None, uses ``pgsqlasync2fast_fastapi.connection.get_manager()``.
+        engine_resolver: ``Callable[[connection_name], AsyncEngine]``.
         layer: Manifest layer to seed (default "boot").
-        package_filter: Optional allow-list of package names.
+        package_filter: Backward-compatible alias for ``include_packages``.
+        include_packages: Only seed these package names.
+        exclude_packages: Skip these package names.
 
     Returns:
         Dict of ``package_name -> SeedingResult`` in execution order.
@@ -1580,11 +1645,29 @@ async def seed_all(
 
         engine_resolver = lambda connection: get_manager().get_engine(connection)  # noqa: E731
 
+    selected = [c for c in get_registered_packages() if not c.disabled]
+
+    include = include_packages if include_packages is not None else package_filter
+    if include:
+        selected = [c for c in selected if c.package_name in include]
+    if exclude_packages:
+        selected = [c for c in selected if c.package_name not in exclude_packages]
+
+    effective = _resolve_effective_tables(selected)
+
     results: dict[str, SeedingResult] = {}
 
-    for config in get_registered_packages():
-        if package_filter and config.package_name not in package_filter:
+    for config in selected:
+        allowed_tables = effective.get(config.package_name, set())
+        if not allowed_tables:
             continue
+
+        all_tables = _manifest_all_tables(config.manifest_path)
+        filters = (
+            SeederFilters(tables=sorted(allowed_tables))
+            if allowed_tables != all_tables
+            else None
+        )
 
         engine = SeederEngine(
             manifest_path=config.manifest_path,
@@ -1595,7 +1678,7 @@ async def seed_all(
             ),
         )
         results[config.package_name] = await engine.seed(
-            config.connection, layer=config.layer or layer
+            config.connection, filters=filters, layer=config.layer or layer
         )
 
     return results
@@ -1724,35 +1807,52 @@ async def adopt_explicit_ids(
     if dry_run or not remaps:
         return remaps
 
-    # 1. Park natural keys of the old rows so inserting new rows with the same
-    #    natural key does not violate UNIQUE constraints. Only text columns are
-    #    parked; UUID/FK components already differ between old and new ids.
-    from sqlalchemy import String
+    # 1. Park every UNIQUE column of the old rows (not just text natural keys)
+    #    so inserting rows with the literal ids cannot violate any UNIQUE
+    #    constraint. FK columns are skipped (their new values differ and a
+    #    random placeholder would break referential integrity).
+    from uuid import uuid4 as _uuid4
 
-    def _text_natural_keys(model: type, natural_key: list[str]) -> list[str]:
-        keys: list[str] = []
-        for key in natural_key:
-            column = model.__table__.c.get(key)
-            if column is None or column.foreign_keys:
-                continue
-            impl = getattr(column.type, "impl", column.type)
-            if isinstance(impl, String):
-                keys.append(key)
-        return keys
+    from sqlalchemy import Integer, String, Uuid as SAUuid
+
+    def _unique_columns(model: type) -> set[str]:
+        names: set[str] = set()
+        for constraint in model.__table__.constraints:
+            if constraint.__class__.__name__ == "UniqueConstraint":
+                names |= {column.name for column in constraint.columns}
+        for column in model.__table__.columns:
+            if column.unique:
+                names.add(column.name)
+        return names
+
+    def _park_value(column: Any, index: int) -> Any:
+        impl = getattr(column.type, "impl", column.type)
+        if isinstance(impl, String):
+            return f"__m{index}_{column.name[:6]}"
+        if isinstance(impl, Integer):
+            return 900_000_000 + index
+        if isinstance(impl, SAUuid):
+            return _uuid4()
+        return None
 
     for table_name in order:
         pairs = plan.get(table_name, [])
         if not pairs:
             continue
-        cfg = tables_cfg[table_name]
-        natural_key = _normalize_natural_key(cfg.get("natural_key")) or []
         model = seeder.model_registry[table_name]
-        text_keys = _text_natural_keys(model, natural_key)
-        if not text_keys:
-            continue
+        unique_columns = _unique_columns(model)
         for index, (_seed_row, obj, _original) in enumerate(pairs):
-            for key in text_keys:
-                setattr(obj, key, f"__migr_{index}_{key}")
+            for column_name in unique_columns:
+                column = model.__table__.c.get(column_name)
+                if (
+                    column is None
+                    or column_name == "id"
+                    or column.foreign_keys
+                ):
+                    continue
+                value = _park_value(column, index)
+                if value is not None:
+                    setattr(obj, column_name, value)
             session.add(obj)
     await session.flush()
 
@@ -1778,7 +1878,9 @@ async def adopt_explicit_ids(
                     data[mapped] = value
             data["id"] = seed_row["id"]
             session.add(model(**data))
-    await session.flush()
+        # Flush per table so parent rows exist before children reference them
+        # (the iteration order is topological; Postgres enforces FKs eagerly).
+        await session.flush()
 
     # 3. Cascade inbound FKs from old ids to new ids.
     metadata = next(iter(seeder.model_registry.values())).__table__.metadata
@@ -1850,6 +1952,9 @@ __all__ = [
     "register_package_seeders",
     "get_registered_packages",
     "clear_package_registry",
+    "set_package_enabled",
+    "disable_package_seeders",
+    "enable_package_seeders",
     "validate_seeders",
     "validate_seeders_report",
     "seed_all",

@@ -10,7 +10,7 @@ Covers:
 from __future__ import annotations
 
 import json
-from uuid import UUID, uuid5, NAMESPACE_URL
+from uuid import UUID, uuid5, uuid7, NAMESPACE_URL
 
 import pytest
 from sqlmodel import SQLModel, Field, select
@@ -538,3 +538,45 @@ class TestSeederComposition:
         eng = await _sqlite_engine()
         assert await seed_all("dev", engine_resolver=lambda _c: eng, exclude_packages=["base"]) == {}
         await eng.dispose()
+
+
+@pytest.mark.asyncio
+async def test_seed_all_adopts_explicit_ids_by_default(tmp_path):
+    """seed_all migrates existing ids to the manifest literals before seeding."""
+    from pgsqlasync2fast_fastapi.seeders import (
+        PackageSeederConfig,
+        register_package_seeders,
+        seed_all,
+    )
+
+    literal = uuid7()
+    path = write_package(
+        tmp_path,
+        tables={"roles": {"file": "roles.json", "natural_key": ["name"]}},
+        data={"roles.json": [{"id": str(literal), "name": "Admin"}]},
+    )
+    register_package_seeders(PackageSeederConfig(
+        package_name="base", manifest_path=path,
+        model_registry=REGISTRY, connection="auth",
+    ))
+
+    eng = await _sqlite_engine()
+    old_id = uuid7()
+    maker = sessionmaker(eng, class_=AsyncSession, expire_on_commit=False)
+    async with maker() as s:
+        s.add(Role(id=old_id, name="Admin"))
+        await s.commit()
+
+    results = await seed_all("dev", engine_resolver=lambda _c: eng)
+    assert results["base"].success
+
+    async with maker() as s:
+        roles = (await s.execute(select(Role))).scalars().all()
+        assert [r.id for r in roles] == [literal]
+    await eng.dispose()
+
+
+def test_insert_if_missing_available_from_new_module():
+    from pgsqlasync2fast_fastapi.seeders import insert_if_missing
+
+    assert callable(insert_if_missing)

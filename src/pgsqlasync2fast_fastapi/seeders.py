@@ -520,6 +520,40 @@ class SeederFilters:
 
 
 # ============================================================================
+# Idempotent Insert-If-Missing Primitive
+# ============================================================================
+
+
+async def insert_if_missing(
+    session: Any,
+    model: type,
+    lookup: dict[str, Any],
+    defaults: dict[str, Any] | None = None,
+):
+    """
+    Insert a row if no row matches the natural-key ``lookup`` fields.
+
+    If a matching row exists it is returned untouched (idempotent); otherwise a
+    new row is built from ``lookup`` merged with ``defaults`` and flushed (the
+    caller owns the transaction boundary).
+    """
+    from sqlmodel import select
+
+    stmt = select(model)
+    for column, value in lookup.items():
+        stmt = stmt.where(getattr(model, column) == value)
+    existing = (await session.execute(stmt)).scalars().first()
+    if existing is not None:
+        return existing
+
+    merged = {**lookup, **(defaults or {})}
+    row = model(**merged)
+    session.add(row)
+    await session.flush()
+    return row
+
+
+# ============================================================================
 # Async Upsert with Change Detection
 # ============================================================================
 
@@ -1619,6 +1653,7 @@ async def seed_all(
     package_filter: list[str] | None = None,
     include_packages: list[str] | None = None,
     exclude_packages: list[str] | None = None,
+    adopt_ids: bool = True,
 ) -> dict[str, SeedingResult]:
     """
     Execute every registered package's seeder in priority order.
@@ -1677,6 +1712,25 @@ async def seed_all(
                 lambda _name, conn=config.connection: engine_resolver(conn)
             ),
         )
+
+        if adopt_ids:
+            from sqlalchemy.ext.asyncio import AsyncSession as _AsyncSession
+
+            try:
+                async with _AsyncSession(engine_resolver(config.connection)) as session:
+                    await adopt_explicit_ids(
+                        session, engine, layer=config.layer or layer
+                    )
+                    await session.commit()
+            except Exception as exc:  # noqa: BLE001 - reported per package
+                results[config.package_name] = SeedingResult(
+                    database_name=config.connection,
+                    profile=profile,
+                    success=False,
+                    errors=[f"{config.package_name}: id adoption failed: {exc}"],
+                )
+                continue
+
         results[config.package_name] = await engine.seed(
             config.connection, filters=filters, layer=config.layer or layer
         )
@@ -2004,6 +2058,7 @@ __all__ = [
     # Async upsert with optimization
     "upsert_with_optimization",
     "upsert_by_natural_key",
+    "insert_if_missing",
     # Validation
     "SeedValidationError",
     "ValidationReport",

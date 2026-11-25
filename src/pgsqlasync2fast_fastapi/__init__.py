@@ -158,6 +158,7 @@ __all__ = [
     "topological_sort",
     "upsert_with_optimization",
     "upsert_by_natural_key",
+    "insert_if_missing",
     "rollback_all",
     "rollback_table",
     # Package seeder registry + validation (ODD-5)

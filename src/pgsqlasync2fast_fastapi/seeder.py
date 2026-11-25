@@ -248,40 +248,14 @@ async def insert_if_missing(
     """
     Insert a row if no row matches the natural-key ``lookup`` fields.
 
-    This is the shared, reusable idempotent **insert-if-missing** primitive.
-    Consumer packages (permissions2fast GLOBAL route seeding, tenants2fast
-    TENANT route seeding) reuse it instead of hand-rolling per package.
-
-    A ``SELECT`` by the ``lookup`` fields decides whether the row already
-    exists: if it does, the existing row is returned untouched (idempotent);
-    otherwise a new row is built from ``lookup`` merged with ``defaults``,
-    added to the session and flushed (no commit — the caller decides the
-    transaction boundary).
-
-    Args:
-        session: SQLModel AsyncSession (supports both ``exec`` and ``execute``).
-        model: SQLModel table class to query/insert.
-        lookup: Mapping of column name -> value that forms the row's natural key.
-        defaults: Optional extra column values applied only on insert.
-
-    Returns:
-        The existing (found) or newly created row instance.
+    Backward-compatible re-export; the implementation lives in
+    ``pgsqlasync2fast_fastapi.seeders`` for new code.
     """
-    from sqlmodel import select
+    from pgsqlasync2fast_fastapi.seeders import (
+        insert_if_missing as _insert_if_missing,
+    )
 
-    stmt = select(model)
-    for col, val in lookup.items():
-        stmt = stmt.where(getattr(model, col) == val)
-    result = await session.exec(stmt)
-    existing = result.first()
-    if existing is not None:
-        return existing
-
-    merged = {**lookup, **(defaults or {})}
-    row = model(**merged)
-    session.add(row)
-    await session.flush()
-    return row
+    return await _insert_if_missing(session, model, lookup, defaults)
 
 
 async def upsert_by_id(

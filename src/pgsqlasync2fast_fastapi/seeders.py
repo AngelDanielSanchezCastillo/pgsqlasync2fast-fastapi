@@ -700,9 +700,11 @@ def _collect_table_errors(
             continue
 
         allowed = set(getattr(model, "model_fields", {}))
+        field_mapping = cfg.get("field_mapping", {})
         unknown: set[str] = set()
         for row in data:
-            unknown |= set(row) - allowed
+            mapped_keys = {field_mapping.get(key, key) for key in row}
+            unknown |= mapped_keys - allowed
         if unknown:
             errors.append(f"{table_name}: unknown keys {sorted(unknown)}")
 
@@ -954,7 +956,13 @@ class SeederEngine:
                     unique_keys = cfg.get("unique_keys")
                     conflict_resolution = cfg.get("conflict_resolution", "validate")
 
-                    resolved = self._resolve_rows(table_name, rows, model, fk_maps)
+                    resolved = self._resolve_rows(
+                        table_name,
+                        rows,
+                        model,
+                        fk_maps,
+                        cfg.get("field_mapping"),
+                    )
 
                     inserted, updated, skipped = await self._seed_table(
                         session=session,
@@ -1010,7 +1018,13 @@ class SeederEngine:
         rows: list[dict[str, Any]],
         model: type,
         fk_maps: dict[str, dict[int, UUID]],
+        field_mapping: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
+        if field_mapping:
+            rows = [
+                {field_mapping.get(key, key): value for key, value in row.items()}
+                for row in rows
+            ]
         resolved = resolve_fks(
             table_name,
             rows,

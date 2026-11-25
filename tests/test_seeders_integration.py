@@ -47,10 +47,19 @@ class Order(SQLModel, table=True):
     quantity: int = Field(default=0)
 
 
+class RenamedOrder(SQLModel, table=True):
+    """Model whose FK column name differs from the JSON field name."""
+
+    __tablename__ = "renamed_orders"
+    id: UUID = Field(primary_key=True)
+    customer_ref: UUID = Field(foreign_key="clients.id")
+
+
 MODEL_REGISTRY = {
     "clients": Client,
     "products": Product,
     "orders": Order,
+    "renamed_orders": RenamedOrder,
 }
 
 
@@ -195,6 +204,43 @@ class TestFullSeedFlow:
         async with maker() as s:
             row = (await s.execute(select(Client))).scalars().first()
             assert row.name == "New"
+
+    @pytest.mark.asyncio
+    async def test_field_mapping_renames_json_keys(self, tmp_path, engine):
+        """field_mapping renames JSON keys to model field names before insert."""
+        from pgsqlasync2fast_fastapi.seeders import SeederEngine, seed_uuid, validate_seeders
+
+        ns = uuid5(NAMESPACE_URL, "https://2fast.local/seed")
+        write_data(tmp_path, "clients.json", [{"id": 1, "name": "Acme"}])
+        # JSON uses client_id; model column is customer_ref
+        write_data(tmp_path, "renamed_orders.json", [{"id": 100, "client_id": 1}])
+        manifest = base_manifest({
+            "clients": {"file": "clients.json", "mode": "upsert"},
+            "renamed_orders": {
+                "file": "renamed_orders.json",
+                "mode": "upsert",
+                "field_mapping": {"client_id": "customer_ref"},
+            },
+        })
+        manifest_path = write_manifest(tmp_path, manifest)
+
+        # Validation must not flag client_id as an unknown key.
+        assert validate_seeders(manifest_path, MODEL_REGISTRY) == []
+
+        seng = SeederEngine(
+            manifest_path=manifest_path,
+            model_registry=MODEL_REGISTRY,
+            profile="dev",
+            database_factory=lambda name: engine,
+        )
+        result = await seng.seed("tenant_a")
+        assert result.success
+
+        maker = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with maker() as s:
+            row = (await s.execute(select(RenamedOrder))).scalars().first()
+            assert row is not None
+            assert row.customer_ref == seed_uuid("clients", 1, ns)
 
     @pytest.mark.asyncio
     async def test_fk_resolution_across_tables(self, tmp_path, engine):

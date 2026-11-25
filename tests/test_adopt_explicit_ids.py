@@ -15,6 +15,7 @@ from uuid import UUID, uuid4, uuid7
 
 import pytest
 from sqlmodel import SQLModel, Field, select
+from sqlalchemy import UniqueConstraint
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -46,11 +47,27 @@ class ARoleUser(SQLModel, table=True):
     user_name: str = Field(max_length=50)
 
 
+class AWorkflow(SQLModel, table=True):
+    __tablename__ = "a_workflows"
+    id: UUID = Field(primary_key=True)
+    name: str = Field(max_length=50, unique=True)
+
+
+class AStage(SQLModel, table=True):
+    __tablename__ = "a_stages"
+    __table_args__ = (UniqueConstraint("workflow_id", "stage_key"),)
+    id: UUID = Field(primary_key=True)
+    workflow_id: UUID = Field(foreign_key="a_workflows.id")
+    stage_key: str = Field(max_length=50)
+
+
 REGISTRY = {
     "a_categories": ACategory,
     "a_roles": ARole,
     "a_permissions": APermission,
     "a_role_users": ARoleUser,
+    "a_workflows": AWorkflow,
+    "a_stages": AStage,
 }
 
 
@@ -204,3 +221,43 @@ async def test_adopt_dry_run_writes_nothing(tmp_path, engine):
     async with maker() as s:
         cats = await fetch(s, ACategory)
         assert [c.id for c in cats] == [old["cat"]]
+
+
+@pytest.mark.asyncio
+async def test_adopt_matches_fk_based_natural_key(tmp_path, engine):
+    """Natural keys containing FKs are matched by translating new literals to old ids."""
+    from pgsqlasync2fast_fastapi.seeders import adopt_explicit_ids
+
+    old_wf, old_stage = uuid4(), uuid4()
+    maker = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with maker() as s:
+        s.add(AWorkflow(id=old_wf, name="Pedidos"))
+        s.add(AStage(id=old_stage, workflow_id=old_wf, stage_key="borrador"))
+        await s.commit()
+
+    new_wf, new_stage = uuid7(), uuid7()
+    write_data(tmp_path, "a_workflows.json", [{"id": str(new_wf), "name": "Pedidos"}])
+    write_data(tmp_path, "a_stages.json", [
+        {"id": str(new_stage), "workflow_id": str(new_wf), "stage_key": "borrador"},
+    ])
+    manifest_path = write_manifest(tmp_path, {
+        "a_workflows": {"file": "a_workflows.json", "mode": "upsert", "natural_key": ["name"]},
+        "a_stages": {
+            "file": "a_stages.json",
+            "mode": "upsert",
+            "natural_key": ["workflow_id", "stage_key"],
+        },
+    })
+    seeder = make_seeder(manifest_path, engine)
+
+    async with maker() as s:
+        remaps = await adopt_explicit_ids(s, seeder, layer="boot")
+        assert len(remaps) == 2
+        await s.commit()
+
+    async with maker() as s:
+        wfs = (await s.execute(select(AWorkflow))).scalars().all()
+        stages = (await s.execute(select(AStage))).scalars().all()
+        assert [w.id for w in wfs] == [new_wf]
+        assert [st.id for st in stages] == [new_stage]
+        assert stages[0].workflow_id == new_wf

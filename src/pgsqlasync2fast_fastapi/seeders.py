@@ -1660,15 +1660,37 @@ async def adopt_explicit_ids(
     if not loaded:
         return []
 
+    dependencies = seeder._resolve_dependencies(list(loaded.keys()), layer)
+    order = topological_sort(dependencies)
+
+    db_to_table = {model.__tablename__: key for key, model in seeder.model_registry.items()}
+
+    def _match_value(model: type, key: str, value: Any, reverse: dict[str, dict[Any, Any]]) -> Any:
+        """Translate a seed FK literal back to its stored (old) id for matching."""
+        column = model.__table__.c.get(key)
+        if column is None or not column.foreign_keys:
+            return value
+        parent_db = next(iter(column.foreign_keys)).column.table.name
+        parent_key = db_to_table.get(parent_db)
+        if parent_key is None:
+            return value
+        return reverse.get(parent_key, {}).get(value, value)
+
     plan: dict[str, list[tuple[dict[str, Any], Any]]] = {}
     remaps: list[IdRemap] = []
+    reverse: dict[str, dict[Any, Any]] = {}
 
-    for table_name, rows in loaded.items():
+    # Process parents first so FK-based natural keys can be translated.
+    for table_name in order:
+        rows = loaded.get(table_name)
+        if not rows:
+            continue
         cfg = tables_cfg.get(table_name, {})
         natural_key = _normalize_natural_key(cfg.get("natural_key"))
         if not natural_key:
             continue
         model = seeder.model_registry[table_name]
+        table_reverse: dict[Any, Any] = {}
 
         for seed_row in rows:
             new_id = seed_row.get("id")
@@ -1676,7 +1698,8 @@ async def adopt_explicit_ids(
                 continue
             stmt = select(model)
             for key in natural_key:
-                stmt = stmt.where(getattr(model, key) == seed_row[key])
+                value = _match_value(model, key, seed_row[key], reverse)
+                stmt = stmt.where(getattr(model, key) == value)
             obj = (await session.execute(stmt)).scalars().first()
             if obj is None:
                 continue  # row will be inserted by the normal seed run
@@ -1685,23 +1708,42 @@ async def adopt_explicit_ids(
                 continue  # already adopted
             plan.setdefault(table_name, []).append((seed_row, obj))
             remaps.append(IdRemap(table_name, old_id, new_id))
+            table_reverse[new_id] = old_id
+
+        if table_reverse:
+            reverse[table_name] = table_reverse
 
     if dry_run or not remaps:
         return remaps
 
-    dependencies = seeder._resolve_dependencies(list(plan.keys()), layer)
-    order = topological_sort(dependencies)
-
     # 1. Park natural keys of the old rows so inserting new rows with the same
-    #    natural key does not violate UNIQUE constraints.
+    #    natural key does not violate UNIQUE constraints. Only text columns are
+    #    parked; UUID/FK components already differ between old and new ids.
+    from sqlalchemy import String
+
+    def _text_natural_keys(model: type, natural_key: list[str]) -> list[str]:
+        keys: list[str] = []
+        for key in natural_key:
+            column = model.__table__.c.get(key)
+            if column is None or column.foreign_keys:
+                continue
+            impl = getattr(column.type, "impl", column.type)
+            if isinstance(impl, String):
+                keys.append(key)
+        return keys
+
     for table_name in order:
         pairs = plan.get(table_name, [])
         if not pairs:
             continue
         cfg = tables_cfg[table_name]
         natural_key = _normalize_natural_key(cfg.get("natural_key")) or []
+        model = seeder.model_registry[table_name]
+        text_keys = _text_natural_keys(model, natural_key)
+        if not text_keys:
+            continue
         for index, (_seed_row, obj) in enumerate(pairs):
-            for key in natural_key:
+            for key in text_keys:
                 setattr(obj, key, f"__migr_{index}_{key}")
             session.add(obj)
     await session.flush()

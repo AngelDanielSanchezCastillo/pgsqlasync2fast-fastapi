@@ -66,6 +66,7 @@ from pgsqlasync2fast_fastapi.seeders import (
     SeederFilters,
     SeederLog,
     SeedingResult,
+    ValidationReport,
     build_all_fk_maps,
     build_fk_map,
     clear_package_registry,
@@ -77,8 +78,10 @@ from pgsqlasync2fast_fastapi.seeders import (
     rollback_table,
     seed_uuid,
     topological_sort,
+    upsert_by_natural_key,
     upsert_with_optimization,
     validate_seeders,
+    validate_seeders_report,
 )
 
 # Re-export migration-specific exports
@@ -149,6 +152,7 @@ __all__ = [
     "resolve_polymorphic_fk",
     "topological_sort",
     "upsert_with_optimization",
+    "upsert_by_natural_key",
     "rollback_all",
     "rollback_table",
     # Package seeder registry + validation (ODD-5)
@@ -158,6 +162,8 @@ __all__ = [
     "get_registered_packages",
     "clear_package_registry",
     "validate_seeders",
+    "validate_seeders_report",
+    "ValidationReport",
     # Migration infrastructure (alembic-2fast)
     "ChainSpec",
     "run_migrations",

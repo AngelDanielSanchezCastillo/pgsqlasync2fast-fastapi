@@ -31,6 +31,14 @@ class Permission(SQLModel, table=True):
     name: str = Field(max_length=50)
 
 
+class Counter(SQLModel, table=True):
+    """Integer primary key model: integer seed ids are legitimate."""
+
+    __tablename__ = "counters"
+    id: int = Field(primary_key=True)
+    name: str = Field(max_length=50)
+
+
 REGISTRY = {"roles": Role, "permissions": Permission}
 
 
@@ -151,19 +159,22 @@ class TestValidateSeeders:
         errors = validate_seeders(path, REGISTRY, profile="prod")
         assert any("prod" in e for e in errors)
 
-    def test_require_uuid_ids_flags_integers(self, tmp_path):
-        from pgsqlasync2fast_fastapi.seeders import validate_seeders
+    def test_integer_ids_against_uuid_pk_are_warnings(self, tmp_path):
+        """Integer ids for a UUID-pk table are advisory warnings, not errors."""
+        from pgsqlasync2fast_fastapi.seeders import validate_seeders_report
 
         path = write_package(
             tmp_path,
             tables={"roles": {"file": "roles.json"}},
             data={"roles.json": [{"id": 1, "name": "Admin"}]},
         )
-        errors = validate_seeders(path, REGISTRY, require_uuid_ids=True)
-        assert any("non-UUID id" in e for e in errors)
+        report = validate_seeders_report(path, REGISTRY)
+        assert report.errors == []
+        assert report.ok
+        assert any("integer id" in w for w in report.warnings)
 
-    def test_require_uuid_ids_accepts_uuids(self, tmp_path):
-        from pgsqlasync2fast_fastapi.seeders import validate_seeders
+    def test_uuid_ids_produce_no_warnings(self, tmp_path):
+        from pgsqlasync2fast_fastapi.seeders import validate_seeders_report
 
         path = write_package(
             tmp_path,
@@ -172,7 +183,22 @@ class TestValidateSeeders:
                 {"id": "edc8dff4-4309-5de9-bdf8-63e2289a2a50", "name": "Admin"},
             ]},
         )
-        assert validate_seeders(path, REGISTRY, require_uuid_ids=True) == []
+        report = validate_seeders_report(path, REGISTRY)
+        assert report.errors == []
+        assert report.warnings == []
+
+    def test_integer_pk_allows_integer_ids(self, tmp_path):
+        """A table with an integer PK legitimately uses integer ids."""
+        from pgsqlasync2fast_fastapi.seeders import validate_seeders_report
+
+        path = write_package(
+            tmp_path,
+            tables={"counters": {"file": "counters.json"}},
+            data={"counters.json": [{"id": 1, "name": "c"}]},
+        )
+        report = validate_seeders_report(path, {"counters": Counter})
+        assert report.errors == []
+        assert report.warnings == []
 
 
 # ============================================================

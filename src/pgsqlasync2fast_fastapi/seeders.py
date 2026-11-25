@@ -428,6 +428,25 @@ class PackageSeederConflictError(ValueError):
     """Raised when two registered packages seed overlapping tables on one connection."""
 
 
+@dataclass
+class ValidationReport:
+    """
+    Result of a stuctural seeder validation.
+
+    ``errors`` are hard failures (broken manifest/data). ``warnings`` are
+    non-blocking advisories, e.g. integer ids used against a UUID primary key
+    (the engine derives a deterministic UUID, but explicit UUIDs are better).
+    """
+
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """True when there are no hard errors."""
+        return not self.errors
+
+
 # ============================================================================
 # Seeding Result
 # ============================================================================
@@ -571,6 +590,68 @@ async def upsert_with_optimization(
     return "updated"
 
 
+async def upsert_by_natural_key(
+    session: Any,
+    model: type,
+    row: dict[str, Any],
+    natural_key: list[str],
+    log: SeederLog | None = None,
+    table_name: str | None = None,
+) -> tuple[str, Any]:
+    """
+    Upsert a row by natural key (e.g. ``["name"]``) instead of by primary key.
+
+    Ids may be omitted: the model generates them on insert (UUID v7/default).
+    When a row with the same natural key exists, only changed fields are
+    updated and its existing id is preserved (safe for pre-existing rows).
+
+    Returns:
+        ``(outcome, obj)`` where outcome is ``"inserted"``, ``"updated"`` or
+        ``"skipped"`` and ``obj`` is the persisted instance.
+    """
+    from sqlmodel import select
+
+    log_key = table_name or model.__tablename__
+
+    stmt = select(model)
+    for key in natural_key:
+        if key not in row:
+            raise SeedValidationError(
+                f"{log_key}: natural key field '{key}' missing in row {row!r}"
+            )
+        stmt = stmt.where(getattr(model, key) == row[key])
+
+    existing = (await session.execute(stmt)).scalars().first()
+
+    if existing is None:
+        obj = model(**row)
+        session.add(obj)
+        await session.flush()
+        if log is not None:
+            log.log_insert(log_key, {**row, "id": getattr(obj, "id", None)})
+        return "inserted", obj
+
+    changed_old_values: dict[str, Any] = {}
+    for key, value in row.items():
+        if key in natural_key or key == "id":
+            continue
+        if not hasattr(existing, key):
+            continue
+        current = getattr(existing, key)
+        if current != value:
+            changed_old_values[key] = current
+            setattr(existing, key, value)
+
+    if not changed_old_values:
+        return "skipped", existing
+
+    session.add(existing)
+    await session.flush()
+    if log is not None:
+        log.log_update(log_key, getattr(existing, "id", None), changed_old_values)
+    return "updated", existing
+
+
 # ============================================================================
 # Rollback
 # ============================================================================
@@ -660,26 +741,37 @@ async def rollback_table(
 # ============================================================================
 
 
-def _collect_table_errors(
+def _pk_is_uuid(model: type) -> bool:
+    """True when the model primary key column is a UUID."""
+    from sqlalchemy import Uuid
+
+    pk = next(iter(model.__table__.primary_key.columns))
+    return isinstance(getattr(pk.type, "impl", pk.type), Uuid) or isinstance(
+        pk.type, Uuid
+    )
+
+
+def _collect_table_issues(
     tables_cfg: dict[str, dict[str, Any]],
     manifest_dir: Path,
     model_registry: dict[str, type],
-    *,
-    require_uuid_ids: bool = False,
-) -> list[str]:
+) -> ValidationReport:
     """
     Validate a ``tables`` config block and its JSON data.
 
-    Checks: model registered, file exists, valid JSON list, no unknown keys,
-    no duplicate values for declared ``unique_keys``, and (optionally) that
-    every row ``id`` is a UUID (package seeders must not ship integer ids).
+    Errors (hard): model registered, file exists, valid JSON list, no unknown
+    keys, no duplicate values for declared ``unique_keys``.
+
+    Warnings (advisory): integer ``id`` against a UUID primary key (the engine
+    derives a deterministic UUID, but explicit UUIDs are preferred). Tables
+    with integer primary keys legitimately use integer ids and are not warned.
     """
-    errors: list[str] = []
+    report = ValidationReport()
 
     for table_name, cfg in tables_cfg.items():
         model = model_registry.get(table_name)
         if model is None:
-            errors.append(f"{table_name}: no model class registered")
+            report.errors.append(f"{table_name}: no model class registered")
             continue
 
         file_name = cfg.get("file", f"{table_name}.json")
@@ -687,40 +779,46 @@ def _collect_table_errors(
         if not path.is_absolute():
             path = manifest_dir / path
         if not path.exists():
-            errors.append(f"{table_name}: seed file not found: {path}")
+            report.errors.append(f"{table_name}: seed file not found: {path}")
             continue
 
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001 - surface any parse error
-            errors.append(f"{table_name}: invalid JSON: {exc}")
+            report.errors.append(f"{table_name}: invalid JSON: {exc}")
             continue
 
         if not isinstance(data, list):
-            errors.append(
+            report.errors.append(
                 f"{table_name}: data must be a list, got {type(data).__name__}"
             )
             continue
 
-        if require_uuid_ids:
+        if _pk_is_uuid(model):
             for row in data:
                 raw_id = row.get("id")
+                if raw_id is None:
+                    continue  # natural-key seeds may legitimately omit id
                 try:
                     UUID(str(raw_id))
                 except (ValueError, TypeError, AttributeError):
-                    errors.append(
-                        f"{table_name}: non-UUID id {raw_id!r} "
-                        "(package seed data must use UUIDs, not integers)"
+                    report.warnings.append(
+                        f"{table_name}: integer id {raw_id!r} against a UUID "
+                        "primary key (the engine derives a deterministic UUID, "
+                        "but explicit UUIDs are preferred)"
                     )
 
         allowed = set(getattr(model, "model_fields", {}))
         field_mapping = cfg.get("field_mapping", {})
+        reference_sources = set(cfg.get("references", {}).keys())
         unknown: set[str] = set()
         for row in data:
-            mapped_keys = {field_mapping.get(key, key) for key in row}
+            mapped_keys = {
+                field_mapping.get(key, key) for key in row
+            } - reference_sources
             unknown |= mapped_keys - allowed
         if unknown:
-            errors.append(f"{table_name}: unknown keys {sorted(unknown)}")
+            report.errors.append(f"{table_name}: unknown keys {sorted(unknown)}")
 
         unique_keys = cfg.get("unique_keys")
         if unique_keys:
@@ -728,14 +826,14 @@ def _collect_table_errors(
             for row in data:
                 key = tuple(row.get(k) for k in unique_keys)
                 if key in seen:
-                    errors.append(
+                    report.errors.append(
                         f"{table_name}: duplicate unique key {key} for "
                         f"columns {unique_keys}"
                     )
                 else:
                     seen.add(key)
 
-    return errors
+    return report
 
 
 class SeederEngine:
@@ -840,17 +938,20 @@ class SeederEngine:
         """
         Validate the seed configuration/data before any write.
 
-        Returns a list of error strings. Raises ``SeedValidationError`` when
-        errors exist AND ``strict`` is True.
+        Returns the hard errors. Logs warnings. Raises ``SeedValidationError``
+        when errors exist AND ``strict`` is True.
         """
-        errors = _collect_table_errors(
+        report = _collect_table_issues(
             tables_cfg, self.manifest_dir, self.model_registry
         )
-        if errors and self.strict:
+        for warning in report.warnings:
+            logger.warning("Seed validation warning: %s", warning)
+        if report.errors and self.strict:
             raise SeedValidationError(
-                f"Invalid seed data for profile '{self.profile}': " + "; ".join(errors)
+                f"Invalid seed data for profile '{self.profile}': "
+                + "; ".join(report.errors)
             )
-        return errors
+        return report.errors
 
     # -- Dependency resolution ---------------------------------------------
 
@@ -956,6 +1057,7 @@ class SeederEngine:
         from sqlalchemy.ext.asyncio import AsyncSession
 
         log = SeederLog()
+        natural_maps: dict[str, dict[Any, Any]] = {}
         async with AsyncSession(engine) as session:
             current_table: str | None = None
             try:
@@ -969,7 +1071,12 @@ class SeederEngine:
                     mode = cfg.get("mode", "upsert")
                     unique_keys = cfg.get("unique_keys")
                     conflict_resolution = cfg.get("conflict_resolution", "validate")
+                    natural_key = _normalize_natural_key(cfg.get("natural_key"))
+                    references = cfg.get("references")
 
+                    rows = self._resolve_references(
+                        table_name, rows, references, natural_maps
+                    )
                     resolved = self._resolve_rows(
                         table_name,
                         rows,
@@ -987,6 +1094,8 @@ class SeederEngine:
                         table_name=table_name,
                         unique_keys=unique_keys,
                         conflict_resolution=conflict_resolution,
+                        natural_key=natural_key,
+                        natural_maps=natural_maps,
                     )
                     await session.commit()
 
@@ -1053,6 +1162,42 @@ class SeederEngine:
             )
         return resolved
 
+    def _resolve_references(
+        self,
+        table_name: str,
+        rows: list[dict[str, Any]],
+        references: dict[str, dict[str, str]] | None,
+        natural_maps: dict[str, dict[Any, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Resolve name-based references (``references``) into parent ids.
+
+        Each source field is replaced by its parent id at ``target_field`` and
+        removed from the row. Requires the referenced table to be seeded first
+        (declare it in ``dependencies``).
+        """
+        if not references:
+            return rows
+
+        resolved: list[dict[str, Any]] = []
+        for row in rows:
+            new_row = dict(row)
+            for source_field, ref in references.items():
+                if source_field not in new_row:
+                    continue
+                value = new_row.pop(source_field)
+                parent_table = ref["table"]
+                target_field = ref.get("target_field", source_field)
+                mapping = natural_maps.get(parent_table, {})
+                if value not in mapping:
+                    raise SeedValidationError(
+                        f"{table_name}.{source_field}={value!r} has no seeded "
+                        f"'{parent_table}' with {ref.get('key', 'name')}"
+                    )
+                new_row[target_field] = mapping[value]
+            resolved.append(new_row)
+        return resolved
+
     async def _seed_table(
         self,
         session: Any,
@@ -1063,6 +1208,8 @@ class SeederEngine:
         table_name: str,
         unique_keys: list[str] | None,
         conflict_resolution: str,
+        natural_key: list[str] | None = None,
+        natural_maps: dict[str, dict[Any, Any]] | None = None,
     ) -> tuple[int, int, int]:
         """Seed one table according to its mode. Returns (inserted, updated, skipped)."""
         if mode not in ("upsert", "insert_only", "skip_if_exists", "replace_all"):
@@ -1083,7 +1230,15 @@ class SeederEngine:
 
         inserted = updated = skipped = 0
         for row in rows:
-            if mode == "insert_only":
+            if natural_key:
+                outcome, obj = await upsert_by_natural_key(
+                    session, model, row, natural_key, log, table_name
+                )
+                if natural_maps is not None:
+                    table_map = natural_maps.setdefault(table_name, {})
+                    for key in natural_key:
+                        table_map[row[key]] = getattr(obj, "id", None)
+            elif mode == "insert_only":
                 outcome = await self._insert_only(session, model, row, log, table_name)
             else:
                 outcome = await upsert_with_optimization(
@@ -1177,6 +1332,17 @@ def _load_manifest_file(manifest_path: str) -> dict[str, Any]:
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _normalize_natural_key(value: Any) -> list[str] | None:
+    """Normalize a manifest ``natural_key`` (string or list) to a list."""
+    if not value:
+        return None
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    raise SeedValidationError(f"Invalid natural_key: {value!r}")
 
 
 def select_count(model: type) -> Any:
@@ -1287,51 +1453,74 @@ def validate_seeders(
     model_registry: dict[str, type],
     layer: str = "boot",
     profile: str = "dev",
-    *,
-    require_uuid_ids: bool = False,
 ) -> list[str]:
     """
     Validate a package's seeder structure without touching a database.
 
-    Intended for CI: every package can assert ``validate_seeders(...) == []``
-    so a broken manifest/JSON never reaches a release. Consumers (e.g.
-    Metal-ERP) can reuse it to validate third-party package seeders too.
+    Returns the hard errors only (empty list when valid). Warnings — such as
+    integer ids used against a UUID primary key — do not block. Use
+    ``validate_seeders_report`` when you also want the warnings (recommended
+    for 2fast packages, which should ship explicit UUIDs).
 
     Args:
         manifest_path: Path to the manifest.json.
         model_registry: Mapping ``table_name -> SQLModel class``.
         layer: Manifest layer to validate ("boot" or "on_demand").
         profile: Profile inside the layer (e.g. "dev", "prod").
-        require_uuid_ids: When True, every row ``id`` must already be a UUID.
-            Package seed data must use UUIDs, never integers; keep this False
-            only for legacy Metal-ERP data during migration.
 
     Returns:
         List of error strings (empty when valid).
     """
+    return validate_seeders_report(
+        manifest_path, model_registry, layer=layer, profile=profile
+    ).errors
+
+
+def validate_seeders_report(
+    manifest_path: str,
+    model_registry: dict[str, type],
+    layer: str = "boot",
+    profile: str = "dev",
+) -> ValidationReport:
+    """
+    Validate a package's seeder structure and return errors + warnings.
+
+    Args:
+        manifest_path: Path to the manifest.json.
+        model_registry: Mapping ``table_name -> SQLModel class``.
+        layer: Manifest layer to validate ("boot" or "on_demand").
+        profile: Profile inside the layer (e.g. "dev", "prod").
+
+    Returns:
+        ``ValidationReport`` with ``errors`` (hard) and ``warnings`` (advisory).
+    """
     try:
         manifest = _load_manifest_file(manifest_path)
     except FileNotFoundError as exc:
-        return [str(exc)]
+        return ValidationReport(errors=[str(exc)])
 
     layer_cfg = manifest.get(layer, {})
     if not layer_cfg:
-        return [f"manifest has no '{layer}' layer"]
+        return ValidationReport(errors=[f"manifest has no '{layer}' layer"])
 
     profile_cfg = layer_cfg.get(profile)
     if profile_cfg is None:
         available = sorted(layer_cfg.keys())
-        return [f"no '{layer}' config for profile '{profile}' (available: {available})"]
+        return ValidationReport(
+            errors=[
+                f"no '{layer}' config for profile '{profile}' "
+                f"(available: {available})"
+            ]
+        )
 
     tables_cfg = profile_cfg.get("tables", {})
     if not tables_cfg:
-        return [f"no tables declared for '{layer}.{profile}'"]
+        return ValidationReport(
+            errors=[f"no tables declared for '{layer}.{profile}'"]
+        )
 
-    return _collect_table_errors(
-        tables_cfg,
-        Path(manifest_path).parent,
-        model_registry,
-        require_uuid_ids=require_uuid_ids,
+    return _collect_table_issues(
+        tables_cfg, Path(manifest_path).parent, model_registry
     )
 
 
@@ -1404,8 +1593,10 @@ __all__ = [
     "topological_sort",
     # Async upsert with optimization
     "upsert_with_optimization",
+    "upsert_by_natural_key",
     # Validation
     "SeedValidationError",
+    "ValidationReport",
     # Results + filters
     "SeedingResult",
     "SeederFilters",
@@ -1421,5 +1612,6 @@ __all__ = [
     "get_registered_packages",
     "clear_package_registry",
     "validate_seeders",
+    "validate_seeders_report",
     "seed_all",
 ]

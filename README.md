@@ -246,6 +246,76 @@ See the `examples/` directory for complete working examples:
 - `fastapi_integration.py` - Complete FastAPI application
 - `database_creation.py` - Creating databases programmatically
 
+## Seeders (v0.7.0+)
+
+Reusable, tenant-agnostic seeder primitives. The engine seeds a single database
+at a time; multi-tenant orchestration lives in `tenants2fast`.
+
+```python
+from pgsqlasync2fast_fastapi import SeederEngine, SeederFilters
+
+engine = SeederEngine(
+    manifest_path="app/seeders/manifest.json",
+    model_registry={"clients": Client, "products": Product},
+    profile="dev",
+    database_factory=lambda name: get_engine(name),
+)
+
+result = await engine.seed("my_database")
+# Optional filters:
+result = await engine.seed(
+    "my_database",
+    filters=SeederFilters(tables=["clients"]),
+)
+```
+
+### Manifest v2.0
+
+```json
+{
+  "version": "2.0",
+  "strict": true,
+  "on_failure": "rollback_all",
+  "uuid_namespace": "01234567-89ab-cdef-0123-456789abcdef",
+  "boot": {
+    "dev": {
+      "tables": {
+        "clients": {"file": "boot/clients.json", "mode": "upsert"}
+      }
+    }
+  },
+  "on_demand": {
+    "demo": {
+      "tables": {
+        "clients": {"file": "on_demand/demo/clients.json", "mode": "insert_only"}
+      }
+    }
+  },
+  "polymorphic_fks": {
+    "addresses": {
+      "addressable_id": {
+        "discriminator": "addressable_type",
+        "map": {"client": "clients", "supplier": "suppliers"}
+      }
+    }
+  }
+}
+```
+
+### Key behaviors
+
+- **Deterministic UUIDs**: `seed_uuid(table, id, namespace)` maps every JSON
+  integer id to a stable UUID v5 (same across tenants and runs).
+- **Efficient upsert**: existing rows are compared field by field; `UPDATE` is
+  issued only when something actually changed.
+- **Rollback**: `on_failure` = `rollback_all` | `rollback_table` | `skip`.
+  Only tables with real changes are rolled back (`SeederLog`).
+- **Strict mode**: `strict: true` aborts before any write when validation fails.
+- **Conflict resolution**: `unique_keys` + `conflict_resolution`
+  (`validate` default, or `park_and_upsert` for transient unique collisions).
+- **FK resolution**: integer FKs are rewritten to deterministic UUIDs; a
+  polymorphic FK map supports discriminated relations.
+
 ## License
 
 MIT License - see LICENSE file for details.

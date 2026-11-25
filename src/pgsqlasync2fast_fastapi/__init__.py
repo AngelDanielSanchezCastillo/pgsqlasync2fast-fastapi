@@ -56,6 +56,25 @@ from pgsqlasync2fast_fastapi.seeder import (
     sync_table_sequence,
 )
 
+# Re-export reusable seeder primitives (ODD-5). Prefer importing from
+# ``pgsqlasync2fast_fastapi.seeders`` directly for the full API, including
+# ``SeedValidationError`` (which would clash with the legacy one here).
+from pgsqlasync2fast_fastapi.seeders import (
+    SeederEngine,
+    SeederFilters,
+    SeederLog,
+    SeedingResult,
+    build_all_fk_maps,
+    build_fk_map,
+    resolve_fks,
+    resolve_polymorphic_fk,
+    rollback_all,
+    rollback_table,
+    seed_uuid,
+    topological_sort,
+    upsert_with_optimization,
+)
+
 # Re-export migration-specific exports
 from pgsqlasync2fast_fastapi.migrations import (
     # Chain spec + runner
@@ -112,6 +131,20 @@ __all__ = [
     "insert_if_missing",
     # Shared PostgreSQL sequence re-sync primitive
     "sync_table_sequence",
+    # Reusable seeder primitives (ODD-5)
+    "SeederEngine",
+    "SeederFilters",
+    "SeederLog",
+    "SeedingResult",
+    "seed_uuid",
+    "build_fk_map",
+    "build_all_fk_maps",
+    "resolve_fks",
+    "resolve_polymorphic_fk",
+    "topological_sort",
+    "upsert_with_optimization",
+    "rollback_all",
+    "rollback_table",
     # Migration infrastructure (alembic-2fast)
     "ChainSpec",
     "run_migrations",

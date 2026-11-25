@@ -36,10 +36,12 @@ Example usage:
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
-from uuid import UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 logger = logging.getLogger(__name__)
 
@@ -409,6 +411,719 @@ def resolve_polymorphic_fk(
 
 
 # ============================================================================
+# Validation Error
+# ============================================================================
+
+
+class SeedValidationError(ValueError):
+    """
+    Raised when seed data fails validation.
+
+    This is separate from ``SeedValidationError`` in ``seeder.py`` (legacy) to
+    keep the new primitives decoupled. Both are ``ValueError`` subclasses.
+    """
+
+
+# ============================================================================
+# Seeding Result
+# ============================================================================
+
+
+@dataclass
+class SeedingResult:
+    """
+    Result of a SeederEngine.seed() run.
+
+    Attributes:
+        success: True when all tables seeded without errors
+        database_name: Target database name
+        profile: Profile used (e.g. "dev")
+        tables_seeded: Number of tables processed
+        rows_inserted: Rows inserted
+        rows_updated: Rows updated (fields actually changed)
+        rows_skipped: Rows skipped (already up to date)
+        errors: List of error messages
+        rolled_back: True when a full rollback was performed
+        table_rolled_back: Table name rolled back (partial rollback)
+        log: The SeederLog with all real changes
+    """
+
+    success: bool = False
+    database_name: str = ""
+    profile: str = ""
+    tables_seeded: int = 0
+    rows_inserted: int = 0
+    rows_updated: int = 0
+    rows_skipped: int = 0
+    errors: list[str] = field(default_factory=list)
+    rolled_back: bool = False
+    table_rolled_back: str | None = None
+    log: SeederLog | None = None
+
+
+# ============================================================================
+# Filters
+# ============================================================================
+
+
+@dataclass
+class SeederFilters:
+    """
+    Generic filters applied before seeding.
+
+    Attributes:
+        tables: Optional allow-list of table names to seed. None = all tables.
+        rows: Optional per-table predicate ``predicate(row) -> bool``. Rows
+            returning False are dropped before seeding.
+
+    Example:
+        >>> filters = SeederFilters(
+        ...     tables=["clients", "products"],
+        ...     rows={"clients": lambda r: r["business_name"] == "Demo"},
+        ... )
+    """
+
+    tables: list[str] | None = None
+    rows: dict[str, Any] = field(default_factory=dict)
+
+    def allows_table(self, table_name: str) -> bool:
+        return self.tables is None or table_name in self.tables
+
+    def apply_rows(self, table_name: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        predicate = self.rows.get(table_name)
+        if predicate is None:
+            return rows
+        return [row for row in rows if predicate(row)]
+
+
+# ============================================================================
+# Async Upsert with Change Detection
+# ============================================================================
+
+
+async def upsert_with_optimization(
+    session: Any,
+    model: type,
+    row: dict[str, Any],
+    log: SeederLog | None = None,
+    table_name: str | None = None,
+) -> str:
+    """
+    Upsert a single row, updating ONLY when fields actually changed.
+
+    Comparison is per-field: if every field already matches, no UPDATE is
+    issued (returns ``"skipped"``). This keeps repeated boot seeding cheap.
+
+    Args:
+        session: Async session (SQLModel or SQLAlchemy).
+        model: SQLModel/SQLAlchemy model class.
+        row: Full row dict including ``id``.
+        log: Optional SeederLog to record real changes.
+        table_name: Override for the log key (defaults to ``model.__tablename__``).
+
+    Returns:
+        One of ``"inserted"``, ``"updated"``, ``"skipped"``.
+
+    Raises:
+        ValueError: If ``id`` is missing.
+    """
+    from sqlmodel import select
+
+    row_id = row.get("id")
+    if row_id is None:
+        raise ValueError("upsert_with_optimization requires 'id' field in row")
+
+    log_key = table_name or model.__tablename__
+
+    result = await session.execute(select(model).where(getattr(model, "id") == row_id))
+    existing = result.scalars().first()
+
+    if existing is None:
+        obj = model(**row)
+        session.add(obj)
+        await session.flush()
+        if log is not None:
+            log.log_insert(log_key, row)
+        return "inserted"
+
+    changed_old_values: dict[str, Any] = {}
+    for key, value in row.items():
+        if key == "id":
+            continue
+        if not hasattr(existing, key):
+            continue
+        current = getattr(existing, key)
+        if current != value:
+            changed_old_values[key] = current
+            setattr(existing, key, value)
+
+    if not changed_old_values:
+        return "skipped"
+
+    session.add(existing)
+    await session.flush()
+    if log is not None:
+        log.log_update(log_key, row_id, changed_old_values)
+    return "updated"
+
+
+# ============================================================================
+# Rollback
+# ============================================================================
+
+
+async def rollback_all(
+    session: Any,
+    log: SeederLog,
+    model_registry: dict[str, type],
+) -> None:
+    """
+    Roll back every real change recorded in ``log``.
+
+    Deletes inserted rows (children first, reverse table order) and restores
+    updated rows to their logged old values.
+    """
+    from sqlmodel import delete, update
+
+    # Delete inserts in reverse insertion order to respect FK constraints.
+    tables_in_insert_order = [t for t in log.affected_tables() if log.inserted_rows.get(t)]
+    for table_name in reversed(tables_in_insert_order):
+        model = model_registry.get(table_name)
+        if model is None:
+            logger.warning("Rollback: no model for table '%s', skipping deletes", table_name)
+            continue
+        ids = [row["id"] for row in log.inserted_rows[table_name]]
+        if ids:
+            await session.execute(
+                delete(model).where(getattr(model, "id").in_(ids))
+            )
+
+    # Restore updates.
+    for table_name, updates in log.updated_rows.items():
+        model = model_registry.get(table_name)
+        if model is None:
+            logger.warning("Rollback: no model for table '%s', skipping updates", table_name)
+            continue
+        for entry in updates:
+            await session.execute(
+                update(model)
+                .where(getattr(model, "id") == entry["id"])
+                .values(**entry["old_values"])
+            )
+
+    await session.flush()
+
+
+async def rollback_table(
+    session: Any,
+    log: SeederLog,
+    model_registry: dict[str, type],
+    table_name: str,
+) -> None:
+    """
+    Roll back real changes for a single table.
+
+    No-op when the table has no recorded changes (efficient partial rollback).
+    """
+    from sqlmodel import delete, update
+
+    if not log.has_changes(table_name):
+        logger.info("Rollback: no changes for table '%s', skipping", table_name)
+        return
+
+    model = model_registry.get(table_name)
+    if model is None:
+        logger.warning("Rollback: no model for table '%s', skipping", table_name)
+        return
+
+    inserted = log.inserted_rows.get(table_name, [])
+    ids = [row["id"] for row in inserted]
+    if ids:
+        await session.execute(delete(model).where(getattr(model, "id").in_(ids)))
+
+    for entry in log.updated_rows.get(table_name, []):
+        await session.execute(
+            update(model)
+            .where(getattr(model, "id") == entry["id"])
+            .values(**entry["old_values"])
+        )
+
+    await session.flush()
+
+
+# ============================================================================
+# SeederEngine: Manifest-Driven Orchestrator
+# ============================================================================
+
+
+class SeederEngine:
+    """
+    Generic, tenant-agnostic seeder engine driven by a manifest v2.0.
+
+    Layers:
+        ``boot``      - automatic seeders (run on app startup)
+        ``on_demand`` - manual seeders (run via CLI / code)
+
+    The engine knows nothing about tenants: it seeds a single database at a
+    time through a ``database_factory`` callable. tenants2fast wraps it to
+    iterate tenants and apply tenant filters.
+
+    Args:
+        manifest_path: Path to the manifest.json file.
+        model_registry: Mapping ``table_name -> SQLModel class``.
+        profile: Profile name (e.g. "dev", "prod", "demo").
+        database_factory: Callable ``(database_name) -> AsyncEngine``.
+        strict: Override manifest ``strict``. None = use manifest value.
+        on_failure: Override manifest ``on_failure``. None = use manifest value.
+        uuid_namespace: Override manifest ``uuid_namespace``.
+
+    Example:
+        >>> engine = SeederEngine(
+        ...     manifest_path="tenant/seeders/manifest.json",
+        ...     model_registry={"clients": Client},
+        ...     profile="dev",
+        ...     database_factory=get_engine,
+        ... )
+        >>> result = await engine.seed("tenant_testcompany")
+    """
+
+    _DEFAULT_NAMESPACE_URL = "https://2fast.local/seed"
+
+    def __init__(
+        self,
+        manifest_path: str,
+        model_registry: dict[str, type],
+        profile: str = "dev",
+        database_factory: Any = None,
+        strict: bool | None = None,
+        on_failure: str | None = None,
+        uuid_namespace: UUID | None = None,
+    ) -> None:
+        self.manifest_path = manifest_path
+        self.manifest_dir = Path(manifest_path).parent
+        self.model_registry = model_registry
+        self.profile = profile
+        self.database_factory = database_factory
+
+        manifest = _load_manifest_file(manifest_path)
+        self.manifest = manifest
+
+        self.strict = strict if strict is not None else manifest.get("strict", True)
+        self.on_failure = on_failure if on_failure is not None else manifest.get(
+            "on_failure", "rollback_all"
+        )
+
+        if uuid_namespace is not None:
+            self.uuid_namespace = uuid_namespace
+        elif manifest.get("uuid_namespace"):
+            self.uuid_namespace = UUID(manifest["uuid_namespace"])
+        else:
+            self.uuid_namespace = uuid5(NAMESPACE_URL, self._DEFAULT_NAMESPACE_URL)
+
+    # -- Manifest helpers ---------------------------------------------------
+
+    def _get_layer_tables(self, layer: str) -> dict[str, dict[str, Any]]:
+        """Return ``tables`` config for the current profile in ``layer``."""
+        layer_cfg = self.manifest.get(layer, {})
+        profile_cfg = layer_cfg.get(self.profile, {})
+        return profile_cfg.get("tables", {})
+
+    def _get_polymorphic_config(self, table_name: str) -> dict[str, dict[str, Any]]:
+        """Return polymorphic FK config for a table (root-level ``polymorphic_fks``)."""
+        return self.manifest.get("polymorphic_fks", {}).get(table_name, {})
+
+    def _load_table_data(self, table_name: str, cfg: dict[str, Any]) -> list[dict[str, Any]]:
+        """Load a table's JSON data (path relative to manifest dir unless absolute)."""
+        file_name = cfg.get("file", f"{table_name}.json")
+        path = Path(file_name)
+        if not path.is_absolute():
+            path = self.manifest_dir / path
+
+        if not path.exists():
+            logger.warning("Seed data not found for '%s': %s", table_name, path)
+            return []
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, list):
+            raise SeedValidationError(
+                f"Table '{table_name}' data must be a list, got {type(data).__name__}"
+            )
+        return data
+
+    # -- Validation ---------------------------------------------------------
+
+    def _validate(self, tables_cfg: dict[str, dict[str, Any]]) -> list[str]:
+        """
+        Validate the seed configuration/data before any write.
+
+        Returns a list of error strings. Raises ``SeedValidationError`` when
+        errors exist AND ``strict`` is True.
+        """
+        errors: list[str] = []
+
+        for table_name, cfg in tables_cfg.items():
+            model = self.model_registry.get(table_name)
+            if model is None:
+                errors.append(f"{table_name}: no model class registered")
+                continue
+
+            try:
+                rows = self._load_table_data(table_name, cfg)
+            except Exception as exc:  # noqa: BLE001 - surface any load error
+                errors.append(f"{table_name}: failed to load data: {exc}")
+                continue
+
+            allowed = set(getattr(model, "model_fields", {}))
+            unknown: set[str] = set()
+            for row in rows:
+                unknown |= set(row) - allowed
+            if unknown:
+                errors.append(f"{table_name}: unknown keys {sorted(unknown)}")
+
+            unique_keys = cfg.get("unique_keys")
+            if unique_keys:
+                seen: set[tuple] = set()
+                for row in rows:
+                    key = tuple(row.get(k) for k in unique_keys)
+                    if key in seen:
+                        errors.append(
+                            f"{table_name}: duplicate unique key {key} for "
+                            f"columns {unique_keys}"
+                        )
+                    else:
+                        seen.add(key)
+
+        if errors and self.strict:
+            raise SeedValidationError(
+                f"Invalid seed data for profile '{self.profile}': " + "; ".join(errors)
+            )
+        return errors
+
+    # -- Dependency resolution ---------------------------------------------
+
+    def _resolve_dependencies(self, table_names: list[str], layer: str) -> dict[str, set[str]]:
+        """
+        Resolve table dependencies.
+
+        Preference order:
+        1. Explicit ``dependencies`` in the manifest for the given layer/profile.
+        2. Explicit ``dependencies`` in the other layer/profile.
+        3. Model FK introspection.
+        """
+        known = set(table_names)
+
+        primary = self.manifest.get(layer, {}).get(self.profile, {})
+        other_layer = "on_demand" if layer == "boot" else "boot"
+        secondary = self.manifest.get(other_layer, {}).get(self.profile, {})
+
+        explicit = primary.get("dependencies") or secondary.get("dependencies")
+        if explicit:
+            return {
+                name: {dep for dep in explicit.get(name, []) if dep in known}
+                for name in table_names
+            }
+
+        # Model FK introspection.
+        deps: dict[str, set[str]] = {}
+        for name in table_names:
+            model = self.model_registry.get(name)
+            if model is None:
+                deps[name] = set()
+                continue
+            deps[name] = {
+                fk.column.table.name
+                for fk in model.__table__.foreign_keys
+                if fk.column.table.name in known and fk.column.table.name != name
+            }
+        return deps
+
+    def _fk_columns(self, table_name: str, model: type) -> dict[str, str]:
+        """Map FK field name -> parent table name from model introspection."""
+        columns: dict[str, str] = {}
+        for column in model.__table__.columns:
+            if column.foreign_keys:
+                columns[column.name] = next(iter(column.foreign_keys)).column.table.name
+        return columns
+
+    # -- Seeding ------------------------------------------------------------
+
+    async def seed(
+        self,
+        database_name: str,
+        filters: SeederFilters | None = None,
+        layer: str = "boot",
+    ) -> SeedingResult:
+        """
+        Seed a single database with the configured layer/profile.
+
+        Args:
+            database_name: Logical database name passed to ``database_factory``.
+            filters: Optional generic filters.
+            layer: ``"boot"`` (default) or ``"on_demand"``.
+
+        Returns:
+            SeedingResult with counters and errors.
+        """
+        result = SeedingResult(database_name=database_name, profile=self.profile)
+
+        tables_cfg = self._get_layer_tables(layer)
+        validation_errors = self._validate(tables_cfg)
+        if validation_errors:
+            result.errors.extend(validation_errors)
+            return result
+
+        # Apply table filter.
+        if filters is not None:
+            tables_cfg = {
+                name: cfg for name, cfg in tables_cfg.items() if filters.allows_table(name)
+            }
+
+        # Load all rows first (fail before writing anything).
+        loaded: dict[str, list[dict[str, Any]]] = {}
+        for table_name, cfg in tables_cfg.items():
+            rows = self._load_table_data(table_name, cfg)
+            if filters is not None:
+                rows = filters.apply_rows(table_name, rows)
+            if rows:
+                loaded[table_name] = rows
+
+        if not loaded:
+            result.success = True
+            return result
+
+        if self.database_factory is None:
+            result.errors.append("No database_factory configured")
+            return result
+
+        fk_maps = build_all_fk_maps(loaded, self.uuid_namespace)
+        dependencies = self._resolve_dependencies(list(loaded.keys()), layer)
+        order = topological_sort(dependencies)
+
+        engine = self.database_factory(database_name)
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        log = SeederLog()
+        async with AsyncSession(engine) as session:
+            current_table: str | None = None
+            try:
+                for table_name in order:
+                    rows = loaded.get(table_name)
+                    if not rows:
+                        continue
+                    current_table = table_name
+                    model = self.model_registry[table_name]
+                    cfg = tables_cfg.get(table_name, {})
+                    mode = cfg.get("mode", "upsert")
+                    unique_keys = cfg.get("unique_keys")
+                    conflict_resolution = cfg.get("conflict_resolution", "validate")
+
+                    resolved = self._resolve_rows(table_name, rows, model, fk_maps)
+
+                    inserted, updated, skipped = await self._seed_table(
+                        session=session,
+                        model=model,
+                        rows=resolved,
+                        mode=mode,
+                        log=log,
+                        table_name=table_name,
+                        unique_keys=unique_keys,
+                        conflict_resolution=conflict_resolution,
+                    )
+                    await session.commit()
+
+                    result.tables_seeded += 1
+                    result.rows_inserted += inserted
+                    result.rows_updated += updated
+                    result.rows_skipped += skipped
+
+                result.success = True
+            except Exception as exc:  # noqa: BLE001 - handled per on_failure
+                await session.rollback()
+                message = f"Seeding failed for '{database_name}' on table '{current_table}': {exc}"
+                logger.error(message)
+                result.errors.append(message)
+                result.log = log
+
+                if self.on_failure == "rollback_all":
+                    try:
+                        await rollback_all(
+                            session, log, self.model_registry
+                        )
+                        await session.commit()
+                        result.rolled_back = True
+                    except Exception as rb_exc:  # noqa: BLE001
+                        result.errors.append(f"Rollback failed: {rb_exc}")
+                elif self.on_failure == "rollback_table" and current_table:
+                    try:
+                        await rollback_table(
+                            session, log, self.model_registry, current_table
+                        )
+                        await session.commit()
+                        result.table_rolled_back = current_table
+                    except Exception as rb_exc:  # noqa: BLE001
+                        result.errors.append(f"Rollback failed: {rb_exc}")
+                # on_failure == "skip": leave committed tables as-is.
+
+        result.log = log
+        return result
+
+    def _resolve_rows(
+        self,
+        table_name: str,
+        rows: list[dict[str, Any]],
+        model: type,
+        fk_maps: dict[str, dict[int, UUID]],
+    ) -> list[dict[str, Any]]:
+        resolved = resolve_fks(
+            table_name,
+            rows,
+            fk_maps,
+            self._fk_columns(table_name, model),
+            self.uuid_namespace,
+        )
+        polymorphic = self._get_polymorphic_config(table_name)
+        if polymorphic:
+            resolved = resolve_polymorphic_fk(
+                table_name, resolved, fk_maps, polymorphic
+            )
+        return resolved
+
+    async def _seed_table(
+        self,
+        session: Any,
+        model: type,
+        rows: list[dict[str, Any]],
+        mode: str,
+        log: SeederLog,
+        table_name: str,
+        unique_keys: list[str] | None,
+        conflict_resolution: str,
+    ) -> tuple[int, int, int]:
+        """Seed one table according to its mode. Returns (inserted, updated, skipped)."""
+        if mode not in ("upsert", "insert_only", "skip_if_exists", "replace_all"):
+            raise ValueError(f"Unsupported seed mode '{mode}' for table '{table_name}'")
+
+        if mode == "replace_all":
+            from sqlmodel import delete
+
+            await session.execute(delete(model))
+
+        if mode == "skip_if_exists":
+            existing = (await session.execute(select_count(model))).first()
+            if existing and existing[0]:
+                return 0, 0, len(rows)
+
+        if unique_keys and conflict_resolution == "park_and_upsert":
+            await self._park_unique_keys(session, model, rows, unique_keys)
+
+        inserted = updated = skipped = 0
+        for row in rows:
+            if mode == "insert_only":
+                outcome = await self._insert_only(session, model, row, log, table_name)
+            else:
+                outcome = await upsert_with_optimization(
+                    session, model, row, log, table_name
+                )
+
+            if outcome == "inserted":
+                inserted += 1
+            elif outcome == "updated":
+                updated += 1
+            else:
+                skipped += 1
+
+        return inserted, updated, skipped
+
+    async def _insert_only(
+        self,
+        session: Any,
+        model: type,
+        row: dict[str, Any],
+        log: SeederLog,
+        table_name: str,
+    ) -> str:
+        from sqlmodel import select
+
+        row_id = row.get("id")
+        result = await session.execute(
+            select(model).where(getattr(model, "id") == row_id)
+        )
+        if result.scalars().first() is not None:
+            raise SeedValidationError(
+                f"insert_only violation: row id={row_id} already exists in '{table_name}'"
+            )
+        session.add(model(**row))
+        await session.flush()
+        log.log_insert(table_name, row)
+        return "inserted"
+
+    async def _park_unique_keys(
+        self,
+        session: Any,
+        model: type,
+        rows: list[dict[str, Any]],
+        unique_keys: list[str],
+    ) -> None:
+        """Park unique keys of existing seed rows to avoid transient collisions.
+
+        Only text columns are parked: UUID/FK columns cannot hold a temporary
+        string value, and breaking one text component of a composite unique
+        key is enough to avoid transient collisions.
+        """
+        from sqlalchemy import String
+        from sqlmodel import select
+
+        columns = model.__table__.c
+
+        def _is_text(column: Any) -> bool:
+            impl = getattr(column.type, "impl", column.type)
+            return isinstance(impl, String)
+
+        parkable = [
+            key
+            for key in unique_keys
+            if key in columns and not columns[key].foreign_keys and _is_text(columns[key])
+        ]
+        if not parkable:
+            logger.debug(
+                "No parkable text columns in unique keys %s for '%s'",
+                unique_keys,
+                model.__tablename__,
+            )
+            return
+
+        ids = [row["id"] for row in rows if row.get("id") is not None]
+        if not ids:
+            return
+        result = await session.execute(
+            select(model).where(getattr(model, "id").in_(ids))
+        )
+        for index, obj in enumerate(result.scalars().all()):
+            for key in parkable:
+                setattr(obj, key, f"__tmp_{index}")
+            session.add(obj)
+        await session.flush()
+
+
+def _load_manifest_file(manifest_path: str) -> dict[str, Any]:
+    """Load a manifest.json file into a dict."""
+    path = Path(manifest_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def select_count(model: type) -> Any:
+    """Return a ``SELECT count(*)`` statement for a model."""
+    from sqlalchemy import func, select as sa_select
+
+    return sa_select(func.count()).select_from(model)
+
+
+# ============================================================================
 # Exports
 # ============================================================================
 
@@ -425,4 +1140,16 @@ __all__ = [
     "resolve_polymorphic_fk",
     # Topological sort
     "topological_sort",
+    # Async upsert with optimization
+    "upsert_with_optimization",
+    # Validation
+    "SeedValidationError",
+    # Results + filters
+    "SeedingResult",
+    "SeederFilters",
+    # Rollback
+    "rollback_all",
+    "rollback_table",
+    # Engine
+    "SeederEngine",
 ]

@@ -1676,7 +1676,7 @@ async def adopt_explicit_ids(
             return value
         return reverse.get(parent_key, {}).get(value, value)
 
-    plan: dict[str, list[tuple[dict[str, Any], Any]]] = {}
+    plan: dict[str, list[tuple[dict[str, Any], Any, dict[str, Any]]]] = {}
     remaps: list[IdRemap] = []
     reverse: dict[str, dict[Any, Any]] = {}
 
@@ -1706,7 +1706,15 @@ async def adopt_explicit_ids(
             old_id = getattr(obj, "id")
             if old_id == new_id:
                 continue  # already adopted
-            plan.setdefault(table_name, []).append((seed_row, obj))
+            # Capture stored values BEFORE parking: parking issues an UPDATE
+            # and server-side defaults (updated_at) would expire the instance,
+            # making later synchronous attribute reads fail (MissingGreenlet).
+            original: dict[str, Any] = {
+                column.name: getattr(obj, column.name)
+                for column in model.__table__.columns
+                if column.name != "id"
+            }
+            plan.setdefault(table_name, []).append((seed_row, obj, original))
             remaps.append(IdRemap(table_name, old_id, new_id))
             table_reverse[new_id] = old_id
 
@@ -1742,7 +1750,7 @@ async def adopt_explicit_ids(
         text_keys = _text_natural_keys(model, natural_key)
         if not text_keys:
             continue
-        for index, (_seed_row, obj) in enumerate(pairs):
+        for index, (_seed_row, obj, _original) in enumerate(pairs):
             for key in text_keys:
                 setattr(obj, key, f"__migr_{index}_{key}")
             session.add(obj)
@@ -1760,12 +1768,8 @@ async def adopt_explicit_ids(
         reference_sources = set(cfg.get("references", {}).keys())
         model = seeder.model_registry[table_name]
 
-        for seed_row, obj in pairs:
-            data = {
-                column.name: getattr(obj, column.name)
-                for column in model.__table__.columns
-                if column.name != "id"
-            }
+        for seed_row, _obj, original in pairs:
+            data = dict(original)
             for key, value in seed_row.items():
                 mapped = field_mapping.get(key, key)
                 if mapped in reference_sources:
@@ -1778,10 +1782,14 @@ async def adopt_explicit_ids(
 
     # 3. Cascade inbound FKs from old ids to new ids.
     metadata = next(iter(seeder.model_registry.values())).__table__.metadata
-    for remap_table, pairs in plan.items():
+    for remap_table in plan:
         model = seeder.model_registry[remap_table]
         target_name = model.__tablename__
-        id_map = {getattr(obj, "id"): seed_row["id"] for seed_row, obj in pairs}
+        id_map = {
+            remap.old_id: remap.new_id
+            for remap in remaps
+            if remap.table == remap_table
+        }
 
         for table in metadata.tables.values():
             for column in table.columns:
@@ -1798,8 +1806,7 @@ async def adopt_explicit_ids(
 
     # 4. Delete old rows (children were already repointed).
     for table_name in reversed(order):
-        model = seeder.model_registry[table_name]
-        for _seed_row, obj in plan.get(table_name, []):
+        for _seed_row, obj, _original in plan.get(table_name, []):
             await session.delete(obj)
     await session.flush()
 

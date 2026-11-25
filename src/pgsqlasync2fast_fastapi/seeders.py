@@ -1698,12 +1698,71 @@ class IdRemap:
     new_id: Any
 
 
+async def _assert_fks_cascade(session: Any, table_names: list[str]) -> None:
+    """Raise when inbound FKs of ``table_names`` are not ON UPDATE CASCADE."""
+    bind = getattr(session, "bind", None)
+    if bind is None or getattr(bind.dialect, "name", None) != "postgresql":
+        return
+    from sqlalchemy import text
+
+    rows = (
+        await session.execute(
+            text(
+                "SELECT c.conname, rp.relname "
+                "FROM pg_constraint c "
+                "JOIN pg_class rp ON rp.oid = c.confrelid "
+                "WHERE c.contype = 'f' "
+                "AND rp.relname = ANY(:tables) "
+                "AND c.confupdtype <> 'c'"
+            ),
+            {"tables": table_names},
+        )
+    ).fetchall()
+    if rows:
+        details = ", ".join(f"{name} ({table})" for name, table in rows)
+        raise RuntimeError(
+            "Cannot adopt explicit ids: these foreign keys are not ON UPDATE "
+            f"CASCADE — run the seeders migrations first: {details}"
+        )
+
+
+async def _adopt_in_place(
+    session: Any,
+    seeder: "SeederEngine",
+    remaps: list[IdRemap],
+    order: list[str],
+) -> None:
+    """Rewrite primary keys in place; the database cascades inbound FKs."""
+    from sqlalchemy import update
+
+    by_table: dict[str, list[IdRemap]] = {}
+    for remap in remaps:
+        by_table.setdefault(remap.table, []).append(remap)
+
+    await _assert_fks_cascade(session, list(by_table))
+
+    for table_name in order:
+        items = by_table.get(table_name)
+        if not items:
+            continue
+        model = seeder.model_registry[table_name]
+        table = model.__table__
+        for remap in items:
+            await session.execute(
+                update(table)
+                .where(table.c.id == remap.old_id)
+                .values(id=remap.new_id)
+            )
+        await session.flush()
+
+
 async def adopt_explicit_ids(
     session: Any,
     seeder: "SeederEngine",
     layer: str = "boot",
     *,
     dry_run: bool = False,
+    strategy: str = "auto",
 ) -> list[IdRemap]:
     """
     Migrate existing rows to the explicit literal ids declared in the manifest.
@@ -1805,6 +1864,16 @@ async def adopt_explicit_ids(
             reverse[table_name] = table_reverse
 
     if dry_run or not remaps:
+        return remaps
+
+    bind = getattr(session, "bind", None)
+    dialect = getattr(getattr(bind, "dialect", None), "name", None)
+    resolved = strategy
+    if strategy == "auto":
+        resolved = "cascade" if dialect == "postgresql" else "copy"
+
+    if resolved == "cascade":
+        await _adopt_in_place(session, seeder, remaps, order)
         return remaps
 
     # 1. Park every UNIQUE column of the old rows (not just text natural keys)

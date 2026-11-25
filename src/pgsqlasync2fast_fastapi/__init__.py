@@ -56,6 +56,36 @@ from pgsqlasync2fast_fastapi.seeder import (
     sync_table_sequence,
 )
 
+# Re-export reusable seeder primitives (ODD-5). Prefer importing from
+# ``pgsqlasync2fast_fastapi.seeders`` directly for the full API, including
+# ``SeedValidationError`` (which would clash with the legacy one here).
+from pgsqlasync2fast_fastapi.seeders import (
+    IdRemap,
+    PackageSeederConfig,
+    PackageSeederConflictError,
+    SeederEngine,
+    SeederFilters,
+    SeederLog,
+    SeedingResult,
+    ValidationReport,
+    build_all_fk_maps,
+    build_fk_map,
+    clear_package_registry,
+    adopt_explicit_ids,
+    get_registered_packages,
+    register_package_seeders,
+    resolve_fks,
+    resolve_polymorphic_fk,
+    rollback_all,
+    rollback_table,
+    seed_uuid,
+    topological_sort,
+    upsert_by_natural_key,
+    upsert_with_optimization,
+    validate_seeders,
+    validate_seeders_report,
+)
+
 # Re-export migration-specific exports
 from pgsqlasync2fast_fastapi.migrations import (
     # Chain spec + runner
@@ -112,6 +142,33 @@ __all__ = [
     "insert_if_missing",
     # Shared PostgreSQL sequence re-sync primitive
     "sync_table_sequence",
+    # Reusable seeder primitives (ODD-5)
+    "SeederEngine",
+    "SeederFilters",
+    "SeederLog",
+    "SeedingResult",
+    "seed_uuid",
+    "build_fk_map",
+    "build_all_fk_maps",
+    "resolve_fks",
+    "resolve_polymorphic_fk",
+    "topological_sort",
+    "upsert_with_optimization",
+    "upsert_by_natural_key",
+    "rollback_all",
+    "rollback_table",
+    # Package seeder registry + validation (ODD-5)
+    "PackageSeederConfig",
+    "PackageSeederConflictError",
+    "register_package_seeders",
+    "get_registered_packages",
+    "clear_package_registry",
+    "validate_seeders",
+    "validate_seeders_report",
+    "ValidationReport",
+    # Explicit-id adoption migration
+    "adopt_explicit_ids",
+    "IdRemap",
     # Migration infrastructure (alembic-2fast)
     "ChainSpec",
     "run_migrations",

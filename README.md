@@ -316,6 +316,54 @@ result = await engine.seed(
 - **FK resolution**: integer FKs are rewritten to deterministic UUIDs; a
   polymorphic FK map supports discriminated relations.
 
+### Packages ship their own seeders (Fase 1.5)
+
+Packages register their seeders at import time, so a consuming app only needs
+`RUN_SEEDERS=true` to get every package's boot data:
+
+```python
+# permissions2fast/__init__.py
+from pgsqlasync2fast_fastapi import (
+    PackageSeederConfig,
+    register_package_seeders,
+)
+
+register_package_seeders(PackageSeederConfig(
+    package_name="permissions2fast-fastapi",
+    manifest_path="permissions2fast_fastapi/seeders/manifest.json",
+    model_registry={"roles": Role, "permissions": Permission},
+    connection="auth",
+    priority=10,
+))
+```
+
+Then the app runs every registered package in priority order:
+
+```python
+from pgsqlasync2fast_fastapi.seeders import seed_all
+
+results = await seed_all("dev")  # dict: package_name -> SeedingResult
+```
+
+### Validate seeders in CI
+
+`validate_seeders()` checks a manifest and its JSON files without a database,
+so a broken seeder never reaches a release:
+
+```python
+from pgsqlasync2fast_fastapi import validate_seeders
+
+def test_seeders_are_valid():
+    errors = validate_seeders(
+        manifest_path="permissions2fast_fastapi/seeders/manifest.json",
+        model_registry={"roles": Role, "permissions": Permission},
+    )
+    assert errors == []
+```
+
+Checks: manifest/layer/profile exist, every table has a model, every file
+exists, JSON is a list, no unknown keys, and no duplicate `unique_keys`.
+
 ## License
 
 MIT License - see LICENSE file for details.

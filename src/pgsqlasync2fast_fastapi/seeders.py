@@ -424,6 +424,10 @@ class SeedValidationError(ValueError):
     """
 
 
+class PackageSeederConflictError(ValueError):
+    """Raised when two registered packages seed overlapping tables on one connection."""
+
+
 # ============================================================================
 # Seeding Result
 # ============================================================================
@@ -656,6 +660,68 @@ async def rollback_table(
 # ============================================================================
 
 
+def _collect_table_errors(
+    tables_cfg: dict[str, dict[str, Any]],
+    manifest_dir: Path,
+    model_registry: dict[str, type],
+) -> list[str]:
+    """
+    Validate a ``tables`` config block and its JSON data.
+
+    Checks: model registered, file exists, valid JSON list, no unknown keys,
+    and no duplicate values for declared ``unique_keys``.
+    """
+    errors: list[str] = []
+
+    for table_name, cfg in tables_cfg.items():
+        model = model_registry.get(table_name)
+        if model is None:
+            errors.append(f"{table_name}: no model class registered")
+            continue
+
+        file_name = cfg.get("file", f"{table_name}.json")
+        path = Path(file_name)
+        if not path.is_absolute():
+            path = manifest_dir / path
+        if not path.exists():
+            errors.append(f"{table_name}: seed file not found: {path}")
+            continue
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001 - surface any parse error
+            errors.append(f"{table_name}: invalid JSON: {exc}")
+            continue
+
+        if not isinstance(data, list):
+            errors.append(
+                f"{table_name}: data must be a list, got {type(data).__name__}"
+            )
+            continue
+
+        allowed = set(getattr(model, "model_fields", {}))
+        unknown: set[str] = set()
+        for row in data:
+            unknown |= set(row) - allowed
+        if unknown:
+            errors.append(f"{table_name}: unknown keys {sorted(unknown)}")
+
+        unique_keys = cfg.get("unique_keys")
+        if unique_keys:
+            seen: set[tuple] = set()
+            for row in data:
+                key = tuple(row.get(k) for k in unique_keys)
+                if key in seen:
+                    errors.append(
+                        f"{table_name}: duplicate unique key {key} for "
+                        f"columns {unique_keys}"
+                    )
+                else:
+                    seen.add(key)
+
+    return errors
+
+
 class SeederEngine:
     """
     Generic, tenant-agnostic seeder engine driven by a manifest v2.0.
@@ -761,40 +827,9 @@ class SeederEngine:
         Returns a list of error strings. Raises ``SeedValidationError`` when
         errors exist AND ``strict`` is True.
         """
-        errors: list[str] = []
-
-        for table_name, cfg in tables_cfg.items():
-            model = self.model_registry.get(table_name)
-            if model is None:
-                errors.append(f"{table_name}: no model class registered")
-                continue
-
-            try:
-                rows = self._load_table_data(table_name, cfg)
-            except Exception as exc:  # noqa: BLE001 - surface any load error
-                errors.append(f"{table_name}: failed to load data: {exc}")
-                continue
-
-            allowed = set(getattr(model, "model_fields", {}))
-            unknown: set[str] = set()
-            for row in rows:
-                unknown |= set(row) - allowed
-            if unknown:
-                errors.append(f"{table_name}: unknown keys {sorted(unknown)}")
-
-            unique_keys = cfg.get("unique_keys")
-            if unique_keys:
-                seen: set[tuple] = set()
-                for row in rows:
-                    key = tuple(row.get(k) for k in unique_keys)
-                    if key in seen:
-                        errors.append(
-                            f"{table_name}: duplicate unique key {key} for "
-                            f"columns {unique_keys}"
-                        )
-                    else:
-                        seen.add(key)
-
+        errors = _collect_table_errors(
+            tables_cfg, self.manifest_dir, self.model_registry
+        )
         if errors and self.strict:
             raise SeedValidationError(
                 f"Invalid seed data for profile '{self.profile}': " + "; ".join(errors)
@@ -1124,6 +1159,197 @@ def select_count(model: type) -> Any:
 
 
 # ============================================================================
+# Package Registry + Orchestration (ODD-5 Fase 1.5)
+# ============================================================================
+
+
+@dataclass
+class PackageSeederConfig:
+    """
+    Configuration for a package that ships its own seeders.
+
+    Packages register at import time so a consuming app only needs to turn on
+    ``RUN_SEEDERS=true`` to get every package's boot data.
+
+    Attributes:
+        package_name: Unique package identifier (registry key).
+        manifest_path: Path to the package's manifest.json.
+        model_registry: Mapping ``table_name -> SQLModel class``.
+        connection: Logical connection/lane this package seeds (e.g. "auth").
+        priority: Lower runs first (default 50).
+        layer: Default manifest layer ("boot" or "on_demand").
+        description: Optional human-readable description.
+    """
+
+    package_name: str
+    manifest_path: str
+    model_registry: dict[str, type]
+    connection: str = "default"
+    priority: int = 50
+    layer: str = "boot"
+    description: str = ""
+
+
+_PACKAGE_REGISTRY: dict[str, PackageSeederConfig] = {}
+
+
+def _manifest_all_tables(manifest_path: str) -> set[str]:
+    """Return every table name declared in a manifest (all layers/profiles)."""
+    manifest = _load_manifest_file(manifest_path)
+    tables: set[str] = set()
+    for layer_name in ("boot", "on_demand"):
+        layer = manifest.get(layer_name, {})
+        for profile_cfg in layer.values():
+            tables |= set(profile_cfg.get("tables", {}).keys())
+    return tables
+
+
+def register_package_seeders(config: PackageSeederConfig) -> None:
+    """
+    Register a package's seeders in the global registry.
+
+    Re-registering the same ``package_name`` replaces the previous entry
+    (idempotent). A *different* package registering overlapping tables on the
+    same connection raises ``PackageSeederConflictError`` to prevent silent
+    data races.
+
+    Args:
+        config: Package seeder configuration.
+
+    Raises:
+        PackageSeederConflictError: On overlapping tables for a distinct
+            package on the same connection.
+    """
+    for existing_name, existing in _PACKAGE_REGISTRY.items():
+        if existing_name == config.package_name:
+            continue
+        if existing.connection != config.connection:
+            continue
+        overlap = _manifest_all_tables(existing.manifest_path) & _manifest_all_tables(
+            config.manifest_path
+        )
+        if overlap:
+            raise PackageSeederConflictError(
+                f"Tables {sorted(overlap)} conflict between "
+                f"'{existing.package_name}' and '{config.package_name}' "
+                f"on connection '{config.connection}'"
+            )
+
+    _PACKAGE_REGISTRY[config.package_name] = config
+    logger.debug(
+        "Registered package seeders: %s (priority=%s, connection=%s)",
+        config.package_name,
+        config.priority,
+        config.connection,
+    )
+
+
+def get_registered_packages() -> list[PackageSeederConfig]:
+    """Return a copy of the package registry (sorted by priority)."""
+    return sorted(_PACKAGE_REGISTRY.values(), key=lambda c: c.priority)
+
+
+def clear_package_registry() -> None:
+    """Clear the package registry. Useful for tests."""
+    _PACKAGE_REGISTRY.clear()
+
+
+def validate_seeders(
+    manifest_path: str,
+    model_registry: dict[str, type],
+    layer: str = "boot",
+    profile: str = "dev",
+) -> list[str]:
+    """
+    Validate a package's seeder structure without touching a database.
+
+    Intended for CI: every package can assert ``validate_seeders(...) == []``
+    so a broken manifest/JSON never reaches a release. Consumers (e.g.
+    Metal-ERP) can reuse it to validate third-party package seeders too.
+
+    Args:
+        manifest_path: Path to the manifest.json.
+        model_registry: Mapping ``table_name -> SQLModel class``.
+        layer: Manifest layer to validate ("boot" or "on_demand").
+        profile: Profile inside the layer (e.g. "dev", "prod").
+
+    Returns:
+        List of error strings (empty when valid).
+    """
+    try:
+        manifest = _load_manifest_file(manifest_path)
+    except FileNotFoundError as exc:
+        return [str(exc)]
+
+    layer_cfg = manifest.get(layer, {})
+    if not layer_cfg:
+        return [f"manifest has no '{layer}' layer"]
+
+    profile_cfg = layer_cfg.get(profile)
+    if profile_cfg is None:
+        available = sorted(layer_cfg.keys())
+        return [f"no '{layer}' config for profile '{profile}' (available: {available})"]
+
+    tables_cfg = profile_cfg.get("tables", {})
+    if not tables_cfg:
+        return [f"no tables declared for '{layer}.{profile}'"]
+
+    return _collect_table_errors(
+        tables_cfg, Path(manifest_path).parent, model_registry
+    )
+
+
+async def seed_all(
+    profile: str,
+    *,
+    engine_resolver: Any = None,
+    layer: str = "boot",
+    package_filter: list[str] | None = None,
+) -> dict[str, SeedingResult]:
+    """
+    Execute every registered package's seeder in priority order.
+
+    Each package is seeded through its own ``SeederEngine`` on the package's
+    configured connection. This is the app-facing entry point: packages that
+    registered themselves at import time are seeded automatically.
+
+    Args:
+        profile: Profile to seed (e.g. "dev", "prod").
+        engine_resolver: ``Callable[[connection_name], AsyncEngine]``. When
+            None, uses ``pgsqlasync2fast_fastapi.connection.get_manager()``.
+        layer: Manifest layer to seed (default "boot").
+        package_filter: Optional allow-list of package names.
+
+    Returns:
+        Dict of ``package_name -> SeedingResult`` in execution order.
+    """
+    if engine_resolver is None:
+        from pgsqlasync2fast_fastapi.connection import get_manager
+
+        engine_resolver = lambda connection: get_manager().get_engine(connection)  # noqa: E731
+
+    results: dict[str, SeedingResult] = {}
+
+    for config in get_registered_packages():
+        if package_filter and config.package_name not in package_filter:
+            continue
+
+        engine = SeederEngine(
+            manifest_path=config.manifest_path,
+            model_registry=config.model_registry,
+            profile=profile,
+            database_factory=(
+                lambda _name, conn=config.connection: engine_resolver(conn)
+            ),
+        )
+        results[config.package_name] = await engine.seed(
+            config.connection, layer=config.layer or layer
+        )
+
+    return results
+
+
+# ============================================================================
 # Exports
 # ============================================================================
 
@@ -1152,4 +1378,12 @@ __all__ = [
     "rollback_table",
     # Engine
     "SeederEngine",
+    # Package registry + orchestration
+    "PackageSeederConfig",
+    "PackageSeederConflictError",
+    "register_package_seeders",
+    "get_registered_packages",
+    "clear_package_registry",
+    "validate_seeders",
+    "seed_all",
 ]

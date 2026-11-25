@@ -60,12 +60,17 @@ from pgsqlasync2fast_fastapi.seeder import (
 # ``pgsqlasync2fast_fastapi.seeders`` directly for the full API, including
 # ``SeedValidationError`` (which would clash with the legacy one here).
 from pgsqlasync2fast_fastapi.seeders import (
+    PackageSeederConfig,
+    PackageSeederConflictError,
     SeederEngine,
     SeederFilters,
     SeederLog,
     SeedingResult,
     build_all_fk_maps,
     build_fk_map,
+    clear_package_registry,
+    get_registered_packages,
+    register_package_seeders,
     resolve_fks,
     resolve_polymorphic_fk,
     rollback_all,
@@ -73,6 +78,7 @@ from pgsqlasync2fast_fastapi.seeders import (
     seed_uuid,
     topological_sort,
     upsert_with_optimization,
+    validate_seeders,
 )
 
 # Re-export migration-specific exports
@@ -145,6 +151,13 @@ __all__ = [
     "upsert_with_optimization",
     "rollback_all",
     "rollback_table",
+    # Package seeder registry + validation (ODD-5)
+    "PackageSeederConfig",
+    "PackageSeederConflictError",
+    "register_package_seeders",
+    "get_registered_packages",
+    "clear_package_registry",
+    "validate_seeders",
     # Migration infrastructure (alembic-2fast)
     "ChainSpec",
     "run_migrations",

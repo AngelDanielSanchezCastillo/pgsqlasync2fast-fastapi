@@ -664,12 +664,15 @@ def _collect_table_errors(
     tables_cfg: dict[str, dict[str, Any]],
     manifest_dir: Path,
     model_registry: dict[str, type],
+    *,
+    require_uuid_ids: bool = False,
 ) -> list[str]:
     """
     Validate a ``tables`` config block and its JSON data.
 
     Checks: model registered, file exists, valid JSON list, no unknown keys,
-    and no duplicate values for declared ``unique_keys``.
+    no duplicate values for declared ``unique_keys``, and (optionally) that
+    every row ``id`` is a UUID (package seeders must not ship integer ids).
     """
     errors: list[str] = []
 
@@ -698,6 +701,17 @@ def _collect_table_errors(
                 f"{table_name}: data must be a list, got {type(data).__name__}"
             )
             continue
+
+        if require_uuid_ids:
+            for row in data:
+                raw_id = row.get("id")
+                try:
+                    UUID(str(raw_id))
+                except (ValueError, TypeError, AttributeError):
+                    errors.append(
+                        f"{table_name}: non-UUID id {raw_id!r} "
+                        "(package seed data must use UUIDs, not integers)"
+                    )
 
         allowed = set(getattr(model, "model_fields", {}))
         field_mapping = cfg.get("field_mapping", {})
@@ -1273,6 +1287,8 @@ def validate_seeders(
     model_registry: dict[str, type],
     layer: str = "boot",
     profile: str = "dev",
+    *,
+    require_uuid_ids: bool = False,
 ) -> list[str]:
     """
     Validate a package's seeder structure without touching a database.
@@ -1286,6 +1302,9 @@ def validate_seeders(
         model_registry: Mapping ``table_name -> SQLModel class``.
         layer: Manifest layer to validate ("boot" or "on_demand").
         profile: Profile inside the layer (e.g. "dev", "prod").
+        require_uuid_ids: When True, every row ``id`` must already be a UUID.
+            Package seed data must use UUIDs, never integers; keep this False
+            only for legacy Metal-ERP data during migration.
 
     Returns:
         List of error strings (empty when valid).
@@ -1309,7 +1328,10 @@ def validate_seeders(
         return [f"no tables declared for '{layer}.{profile}'"]
 
     return _collect_table_errors(
-        tables_cfg, Path(manifest_path).parent, model_registry
+        tables_cfg,
+        Path(manifest_path).parent,
+        model_registry,
+        require_uuid_ids=require_uuid_ids,
     )
 
 

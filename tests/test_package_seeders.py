@@ -151,6 +151,29 @@ class TestValidateSeeders:
         errors = validate_seeders(path, REGISTRY, profile="prod")
         assert any("prod" in e for e in errors)
 
+    def test_require_uuid_ids_flags_integers(self, tmp_path):
+        from pgsqlasync2fast_fastapi.seeders import validate_seeders
+
+        path = write_package(
+            tmp_path,
+            tables={"roles": {"file": "roles.json"}},
+            data={"roles.json": [{"id": 1, "name": "Admin"}]},
+        )
+        errors = validate_seeders(path, REGISTRY, require_uuid_ids=True)
+        assert any("non-UUID id" in e for e in errors)
+
+    def test_require_uuid_ids_accepts_uuids(self, tmp_path):
+        from pgsqlasync2fast_fastapi.seeders import validate_seeders
+
+        path = write_package(
+            tmp_path,
+            tables={"roles": {"file": "roles.json"}},
+            data={"roles.json": [
+                {"id": "edc8dff4-4309-5de9-bdf8-63e2289a2a50", "name": "Admin"},
+            ]},
+        )
+        assert validate_seeders(path, REGISTRY, require_uuid_ids=True) == []
+
 
 # ============================================================
 # register_package_seeders

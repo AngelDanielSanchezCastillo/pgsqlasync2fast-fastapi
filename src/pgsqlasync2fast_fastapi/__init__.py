@@ -143,6 +143,7 @@ __all__ = [
     "seed_all",
     # Shared idempotent insert-if-missing primitive
     "insert_if_missing",
+    "load_table_data",
     # Shared PostgreSQL sequence re-sync primitive
     "sync_table_sequence",
     # Reusable seeder primitives (ODD-5)

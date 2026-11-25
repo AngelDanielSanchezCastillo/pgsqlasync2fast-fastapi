@@ -1386,6 +1386,36 @@ class SeederEngine:
         await session.flush()
 
 
+def load_table_data(
+    manifest_path: str,
+    table_name: str,
+    profile: str = "dev",
+    layer: str = "boot",
+) -> list[dict[str, Any]]:
+    """Load one table's seed rows from a manifest (public, read-only helper)."""
+    manifest = _load_manifest_file(manifest_path)
+    cfg = (
+        manifest.get(layer, {})
+        .get(profile, {})
+        .get("tables", {})
+        .get(table_name, {})
+    )
+    if not cfg:
+        return []
+    file_name = cfg.get("file", f"{table_name}.json")
+    path = Path(file_name)
+    if not path.is_absolute():
+        path = Path(manifest_path).parent / path
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise SeedValidationError(
+            f"Table '{table_name}' data must be a list, got {type(data).__name__}"
+        )
+    return data
+
+
 def _load_manifest_file(manifest_path: str) -> dict[str, Any]:
     """Load a manifest.json file into a dict."""
     path = Path(manifest_path)
@@ -2059,6 +2089,7 @@ __all__ = [
     "upsert_with_optimization",
     "upsert_by_natural_key",
     "insert_if_missing",
+    "load_table_data",
     # Validation
     "SeedValidationError",
     "ValidationReport",

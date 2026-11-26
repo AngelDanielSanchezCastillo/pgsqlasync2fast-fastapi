@@ -638,6 +638,8 @@ async def upsert_by_natural_key(
     Ids may be omitted: the model generates them on insert (UUID v7/default).
     When a row with the same natural key exists, only changed fields are
     updated and its existing id is preserved (safe for pre-existing rows).
+    If the natural key was edited but the literal id is still present, the row
+    is left untouched instead of failing on a primary-key conflict.
 
     Returns:
         ``(outcome, obj)`` where outcome is ``"inserted"``, ``"updated"`` or
@@ -656,6 +658,18 @@ async def upsert_by_natural_key(
         stmt = stmt.where(getattr(model, key) == row[key])
 
     existing = (await session.execute(stmt)).scalars().first()
+
+    if existing is None and row.get("id") is not None:
+        # The literal id may already be present after a natural-key edit
+        # (e.g. a user renamed a seeded catalog row). Inserting the literal
+        # would violate the primary key; keep the user's row untouched.
+        existing = (
+            await session.execute(
+                select(model).where(getattr(model, "id") == row["id"])
+            )
+        ).scalars().first()
+        if existing is not None:
+            return "skipped", existing
 
     if existing is None:
         obj = model(**row)

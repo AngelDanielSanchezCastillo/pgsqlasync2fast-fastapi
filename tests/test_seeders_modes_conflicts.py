@@ -391,3 +391,35 @@ class TestPolymorphic:
         by_street = {a.street: a for a in addresses}
         assert by_street["Main"].addressable_id == seed_uuid("m_clients", 1, ns)
         assert by_street["Side"].addressable_id == seed_uuid("m_suppliers", 1, ns)
+
+
+class TestNaturalKeyIdFallback:
+    @pytest.mark.asyncio
+    async def test_renamed_natural_key_with_literal_id_is_skipped(
+        self, tmp_path, engine
+    ):
+        """A user-renamed seed row keeps its literal id and must not crash."""
+        literal = str(uuid4())
+        maker = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with maker() as session:
+            session.add(MClient(id=UUID(literal), name="Renamed by user"))
+            await session.commit()
+
+        write_data(tmp_path, "m_clients.json", [{"id": literal, "name": "Original"}])
+        manifest_path = write_manifest(
+            tmp_path,
+            {
+                "m_clients": {
+                    "file": "m_clients.json",
+                    "mode": "upsert",
+                    "natural_key": ["name"],
+                }
+            },
+        )
+        seng = make_engine(manifest_path, engine)
+        result = await seng.seed("db")
+
+        assert result.success, result.errors
+        rows = await fetch_all(engine, MClient)
+        assert len(rows) == 1
+        assert rows[0].name == "Renamed by user"

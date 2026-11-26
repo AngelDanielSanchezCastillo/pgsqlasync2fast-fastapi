@@ -504,7 +504,9 @@ def dedupe_unique_columns_alembic(
         dependents: ``(child_table, fk_column, sibling_columns)`` for each child
             holding a FK to ``table_name.id``. ``sibling_columns`` are the other
             columns of the child's unique constraint, used to skip repoints
-            that would collide.
+            that would collide. Pass an empty sequence when the child has no
+            unique constraint: the FK is then always repointed and **no child
+            rows are deleted** (they are business data, not duplicates).
         keep: ``"min"`` (default) or ``"max"`` id to keep.
     """
     if not key_columns:
@@ -538,26 +540,41 @@ def dedupe_unique_columns_alembic(
     )
 
     for child_table, fk_column, sibling_columns in dependents:
-        sibling_guard = "".join(
-            f" AND x.{sibling} = c.{sibling}" for sibling in sibling_columns
-        )
-        op_obj.execute(
-            f"""
-            UPDATE {child_table} AS c
-            SET {fk_column} = d.keep_id
-            FROM {temp_table} AS d
-            WHERE c.{fk_column} = d.dup_id
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM {child_table} AS x
-                  WHERE x.{fk_column} = d.keep_id{sibling_guard}
-              )
-            """
-        )
-        op_obj.execute(
-            f"DELETE FROM {child_table} AS c USING {temp_table} AS d "
-            f"WHERE c.{fk_column} = d.dup_id"
-        )
+        if sibling_columns:
+            # The child has its own unique constraint: skip repoints that would
+            # collide, then drop the leftovers (the pair already exists under
+            # the kept parent, so removing them is lossless).
+            sibling_guard = "".join(
+                f" AND x.{sibling} = c.{sibling}" for sibling in sibling_columns
+            )
+            op_obj.execute(
+                f"""
+                UPDATE {child_table} AS c
+                SET {fk_column} = d.keep_id
+                FROM {temp_table} AS d
+                WHERE c.{fk_column} = d.dup_id
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {child_table} AS x
+                      WHERE x.{fk_column} = d.keep_id{sibling_guard}
+                  )
+                """
+            )
+            op_obj.execute(
+                f"DELETE FROM {child_table} AS c USING {temp_table} AS d "
+                f"WHERE c.{fk_column} = d.dup_id"
+            )
+        else:
+            # No declared unique constraint on the child: always repoint and
+            # never delete (deleting would silently drop business rows).
+            op_obj.execute(
+                f"""
+                UPDATE {child_table} AS c
+                SET {fk_column} = d.keep_id
+                FROM {temp_table} AS d
+                WHERE c.{fk_column} = d.dup_id
+                """
+            )
 
     op_obj.execute(
         f"DELETE FROM {table_name} AS t USING {temp_table} AS d "

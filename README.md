@@ -246,7 +246,7 @@ See the `examples/` directory for complete working examples:
 - `fastapi_integration.py` - Complete FastAPI application
 - `database_creation.py` - Creating databases programmatically
 
-## Seeders (v0.7.0+)
+## Seeders (v0.9.0+)
 
 Reusable, tenant-agnostic seeder primitives. The engine seeds a single database
 at a time; multi-tenant orchestration lives in `tenants2fast`.
@@ -304,8 +304,12 @@ result = await engine.seed(
 
 ### Key behaviors
 
-- **Deterministic UUIDs**: `seed_uuid(table, id, namespace)` maps every JSON
-  integer id to a stable UUID v5 (same across tenants and runs).
+- **Explicit UUID literals**: seed JSON should ship explicit UUIDs (preferably
+  uuid7, generated once). The engine never rewrites them. `seed_uuid(table, id,
+  namespace)` (uuid5) remains only as a legacy aid to derive UUIDs from integer
+  ids; new data should not rely on it.
+- **Natural-key idempotency**: a table can declare `natural_key` (e.g. `name`),
+  so re-seeding matches existing rows by that key instead of the primary key.
 - **Efficient upsert**: existing rows are compared field by field; `UPDATE` is
   issued only when something actually changed.
 - **Rollback**: `on_failure` = `rollback_all` | `rollback_table` | `skip`.
@@ -313,8 +317,46 @@ result = await engine.seed(
 - **Strict mode**: `strict: true` aborts before any write when validation fails.
 - **Conflict resolution**: `unique_keys` + `conflict_resolution`
   (`validate` default, or `park_and_upsert` for transient unique collisions).
-- **FK resolution**: integer FKs are rewritten to deterministic UUIDs; a
-  polymorphic FK map supports discriminated relations.
+- **FK resolution**: integer FKs are rewritten to deterministic UUIDs when
+  present; a polymorphic FK map supports discriminated relations.
+- **Public helpers**: `load_table_data()` reads one table/profile; `Validator`
+  via `validate_seeders`/`validate_seeders_report`.
+
+### Seed-id adoption (migrating older databases)
+
+When literals change or a project migrates from derived ids, use
+`adopt_explicit_ids` before seeding:
+
+```python
+from pgsqlasync2fast_fastapi import SeederEngine, adopt_explicit_ids
+
+engine = SeederEngine(manifest_path=..., model_registry=..., profile="dev")
+async with AsyncSession(engine_for_connection) as session:
+    await adopt_explicit_ids(session, engine)   # strategy="auto"
+    await session.commit()
+```
+
+On PostgreSQL it updates primary keys **in place** and relies on
+`ON UPDATE CASCADE` FKs (see `pgsqlasync2fast_fastapi.migrations.fk_cascade`,
+used by package/app migration chains). On SQLite it falls back to the
+copy/repoint/delete strategy. `dry_run=True` returns the plan without writing;
+`seed_all` does this automatically with `adopt_ids=True`.
+
+### Composition: packages + app
+
+`seed_all` runs every registered package and supports additive apps, overrides
+and opt-outs:
+
+```python
+results = await seed_all("dev")                       # all packages, adopts ids
+results = await seed_all("dev", exclude_packages=["pkg-b"])
+results = await seed_all("dev", include_packages=["app-seeders"])
+```
+
+- `PackageSeederConfig.overrides`: take exclusive ownership of a table.
+- `PackageSeederConfig.disabled`: skip a package.
+- `set_package_enabled` / `disable_package_seeders` / `enable_package_seeders`.
+- Conflicting overlaps without `overrides` raise at registration.
 
 ### Packages ship their own seeders (Fase 1.5)
 

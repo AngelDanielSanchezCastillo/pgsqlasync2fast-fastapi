@@ -7,7 +7,7 @@ Use these helpers only when migrating existing databases from BigInteger to UUID
 New databases should use UUIDIdMixin from the start.
 """
 import warnings
-from typing import List
+from typing import List, Sequence
 from uuid import UUID, uuid7
 
 from sqlalchemy import text
@@ -461,6 +461,108 @@ def convert_unique_column_to_uuid_alembic(
     op_obj.drop_column(table_name, column_name)
     op_obj.alter_column(table_name, new_column, new_column_name=column_name)
     op_obj.create_index(index_name, table_name, [column_name], unique=True)
+
+
+def dedupe_unique_columns_alembic(
+    op_obj,
+    table_name: str,
+    key_columns: Sequence[str],
+    *,
+    index_name: str | None = None,
+    dependents: Sequence[tuple[str, str, Sequence[str]]] = (),
+    keep: str = "min",
+) -> None:
+    """Collapse rows that violate a UNIQUE index before a PK UUID swap.
+
+    A BigInteger → UUID PK conversion runs ``UPDATE table SET id_uuid = ...``.
+    When that UPDATE is not HOT, PostgreSQL re-validates every unique index and
+    aborts if the heap and the index drifted apart (e.g. a logical restore left
+    duplicate keys behind a valid-looking unique index).
+
+    The caller owns the semantics: it declares the unique ``key_columns`` and
+    every ``dependents`` entry as ``(child_table, fk_column, sibling_columns)``.
+    The lowest (or highest) ``id`` per key is kept; declared children are
+    repointed to it, skipping rows that would collide on the child's own unique
+    constraint, and leftovers are deleted. The unique index is dropped and
+    rebuilt so it reflects the heap again.
+
+    This is opt-in by design: it never guesses which duplicates are safe to
+    merge. Do not call it on identity tables (users, roles with polymorphic
+    assignments) unless you have declared every semantic dependent.
+
+    Args:
+        op_obj: Alembic operations object.
+        table_name: Parent table (must have a single ``id`` PK column).
+        key_columns: Columns that make up the unique index.
+        index_name: Unique index to rebuild. ``None`` dedupes without touching
+            the index (useful for ad-hoc children).
+        dependents: ``(child_table, fk_column, sibling_columns)`` for each child
+            holding a FK to ``table_name.id``. ``sibling_columns`` are the other
+            columns of the child's unique constraint, used to skip repoints
+            that would collide.
+        keep: ``"min"`` (default) or ``"max"`` id to keep.
+    """
+    if not key_columns:
+        raise ValueError("dedupe_unique_columns_alembic requires at least one key column")
+    if keep not in ("min", "max"):
+        raise ValueError("keep must be 'min' or 'max'")
+
+    cols = ", ".join(key_columns)
+    not_null = " AND ".join(f"{column} IS NOT NULL" for column in key_columns)
+    join_parent = " AND ".join(f"k.{column} = t.{column}" for column in key_columns)
+    aggregate = "MIN" if keep == "min" else "MAX"
+    temp_table = f"_uuid_dedupe_{table_name}"
+
+    op_obj.execute(f"DROP TABLE IF EXISTS {temp_table}")
+    op_obj.execute(
+        f"""
+        CREATE TEMP TABLE {temp_table} AS
+        SELECT t.id AS dup_id, k.keep_id
+        FROM {table_name} AS t
+        JOIN (
+            SELECT {cols}, {aggregate}(id) AS keep_id
+            FROM {table_name}
+            WHERE {not_null}
+            GROUP BY {cols}
+            HAVING COUNT(*) > 1
+        ) AS k ON {join_parent}
+        WHERE t.id <> k.keep_id
+        """
+    )
+
+    for child_table, fk_column, sibling_columns in dependents:
+        sibling_guard = "".join(
+            f" AND x.{sibling} = c.{sibling}" for sibling in sibling_columns
+        )
+        op_obj.execute(
+            f"""
+            UPDATE {child_table} AS c
+            SET {fk_column} = d.keep_id
+            FROM {temp_table} AS d
+            WHERE c.{fk_column} = d.dup_id
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {child_table} AS x
+                  WHERE x.{fk_column} = d.keep_id{sibling_guard}
+              )
+            """
+        )
+        op_obj.execute(
+            f"DELETE FROM {child_table} AS c USING {temp_table} AS d "
+            f"WHERE c.{fk_column} = d.dup_id"
+        )
+
+    op_obj.execute(
+        f"DELETE FROM {table_name} AS t USING {temp_table} AS d "
+        "WHERE t.id = d.dup_id"
+    )
+    op_obj.execute(f"DROP TABLE IF EXISTS {temp_table}")
+
+    if index_name:
+        op_obj.execute(f"DROP INDEX IF EXISTS {index_name}")
+        op_obj.execute(
+            f"CREATE UNIQUE INDEX {index_name} ON {table_name} ({cols})"
+        )
 
 
 

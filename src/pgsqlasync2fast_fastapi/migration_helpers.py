@@ -469,6 +469,7 @@ def dedupe_unique_columns_alembic(
     key_columns: Sequence[str],
     *,
     index_name: str | None = None,
+    constraint_name: str | None = None,
     dependents: Sequence[tuple[str, str, Sequence[str]]] = (),
     keep: str = "min",
 ) -> None:
@@ -495,7 +496,11 @@ def dedupe_unique_columns_alembic(
         table_name: Parent table (must have a single ``id`` PK column).
         key_columns: Columns that make up the unique index.
         index_name: Unique index to rebuild. ``None`` dedupes without touching
-            the index (useful for ad-hoc children).
+            the index (useful for ad-hoc children). Mutually exclusive with
+            ``constraint_name``.
+        constraint_name: Unique constraint to rebuild (``ALTER TABLE ... DROP
+            CONSTRAINT`` / ``ADD CONSTRAINT``). Use this when the database object
+            is a constraint (``uq_*``) instead of a standalone index.
         dependents: ``(child_table, fk_column, sibling_columns)`` for each child
             holding a FK to ``table_name.id``. ``sibling_columns`` are the other
             columns of the child's unique constraint, used to skip repoints
@@ -506,6 +511,8 @@ def dedupe_unique_columns_alembic(
         raise ValueError("dedupe_unique_columns_alembic requires at least one key column")
     if keep not in ("min", "max"):
         raise ValueError("keep must be 'min' or 'max'")
+    if index_name and constraint_name:
+        raise ValueError("pass index_name or constraint_name, not both")
 
     cols = ", ".join(key_columns)
     not_null = " AND ".join(f"{column} IS NOT NULL" for column in key_columns)
@@ -558,7 +565,15 @@ def dedupe_unique_columns_alembic(
     )
     op_obj.execute(f"DROP TABLE IF EXISTS {temp_table}")
 
-    if index_name:
+    if constraint_name:
+        op_obj.execute(
+            f"ALTER TABLE {table_name} DROP CONSTRAINT IF EXISTS {constraint_name}"
+        )
+        op_obj.execute(
+            f"ALTER TABLE {table_name} ADD CONSTRAINT {constraint_name} "
+            f"UNIQUE ({cols})"
+        )
+    elif index_name:
         op_obj.execute(f"DROP INDEX IF EXISTS {index_name}")
         op_obj.execute(
             f"CREATE UNIQUE INDEX {index_name} ON {table_name} ({cols})"
